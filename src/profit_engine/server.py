@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .dashboard_state import STATE_PATH, build_state, ensure_dashboard_state, load_state
+from .db import using_postgres
 from .notify import email_configured, load_notify_status
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -25,7 +26,7 @@ CRON_SECRET = os.environ.get("CRON_SECRET", "signal-desk-paper-sync")
 INITIAL_CASH = float(os.environ.get("PAPER_CASH", "1000"))
 ALLOW_PUBLIC_SYNC = os.environ.get("ALLOW_PUBLIC_SYNC", "1") == "1"
 ET = ZoneInfo("America/New_York")
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 _sync_lock = threading.Lock()
 _scheduler: BackgroundScheduler | None = None
@@ -168,6 +169,7 @@ def health():
         "version": VERSION,
         "email_ready": email_configured(),
         "trade_alerts": os.environ.get("TRADE_ALERTS", "1") == "1",
+        "db_backend": "postgres" if using_postgres() else "sqlite",
     }
 
 
@@ -199,6 +201,7 @@ def config():
         "next_sync_at": _next_scheduled_sync().isoformat(),
         "trade_alert_email": os.environ.get("TRADE_ALERT_EMAIL", "tarun.vadapalli.1@gmail.com"),
         "email_ready": email_configured(),
+        "db_backend": "postgres" if using_postgres() else "sqlite",
         "version": VERSION,
     }
 

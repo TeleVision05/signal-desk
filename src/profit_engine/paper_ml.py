@@ -88,13 +88,9 @@ def sync_ml_paper(
     action = "hold"
     entry_px = mark
     if shares > 0:
-        with ledger._conn() as conn:
-            row = conn.execute(
-                "SELECT price FROM fills WHERE run_id=? AND side='BUY' ORDER BY id DESC LIMIT 1",
-                (run_id,),
-            ).fetchone()
-            if row:
-                entry_px = float(row["price"])
+        buy_px = ledger.last_buy_price(run_id)
+        if buy_px is not None:
+            entry_px = buy_px
         peak = max(entry_px, float(bar["High"]))
         hit, exit_px = _stop_hit(bar, entry_px, peak, stop)
         if hit and exit_px is not None:

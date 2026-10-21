@@ -1,4 +1,4 @@
-"""Persist each paper sync decision so the desk can show p vs threshold history."""
+"""Persist each paper sync decision (Postgres via DATABASE_URL, else JSON file)."""
 
 from __future__ import annotations
 
@@ -6,12 +6,19 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .db import database_url
+
 ROOT = Path(__file__).resolve().parents[2]
 LOG_PATH = ROOT / "data" / "decision_log.json"
 MAX_ROWS = 120
+RUN_ID = "ml-tqqq-hgb-paper-v1"
 
 
-def _load() -> list[dict[str, Any]]:
+def _dedupe_key(row: dict[str, Any]) -> str:
+    return f"{row.get('bar_date')}|{str(row.get('synced_at') or '')[:16]}|{row.get('action')}"
+
+
+def _load_file() -> list[dict[str, Any]]:
     if not LOG_PATH.exists():
         return []
     try:
@@ -21,16 +28,50 @@ def _load() -> list[dict[str, Any]]:
         return []
 
 
+def _pg_conn():
+    import psycopg
+    from psycopg.rows import dict_row
+
+    return psycopg.connect(database_url(), row_factory=dict_row)
+
+
 def append_decision(row: dict[str, Any]) -> list[dict[str, Any]]:
+    key = _dedupe_key(row)
+    url = database_url()
+    if url:
+        payload = json.dumps(row, default=str)
+        with _pg_conn() as conn:
+            with conn.transaction():
+                conn.execute("DELETE FROM paper_decisions WHERE dedupe_key = %s", (key,))
+                conn.execute(
+                    """
+                    INSERT INTO paper_decisions(run_id, bar_date, synced_at, action, dedupe_key, payload)
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    (
+                        row.get("run_id") or RUN_ID,
+                        row.get("bar_date"),
+                        row.get("synced_at"),
+                        row.get("action"),
+                        key,
+                        payload,
+                    ),
+                )
+                # Cap history
+                conn.execute(
+                    """
+                    DELETE FROM paper_decisions
+                    WHERE id NOT IN (
+                      SELECT id FROM paper_decisions ORDER BY id DESC LIMIT %s
+                    )
+                    """,
+                    (MAX_ROWS,),
+                )
+        return load_decisions(limit=MAX_ROWS)
+
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    rows = _load()
-    # Dedupe same bar+sync minute to avoid spam on rapid retries
-    key = (row.get("bar_date"), row.get("synced_at", "")[:16], row.get("action"))
-    rows = [
-        r
-        for r in rows
-        if (r.get("bar_date"), str(r.get("synced_at") or "")[:16], r.get("action")) != key
-    ]
+    rows = _load_file()
+    rows = [r for r in rows if _dedupe_key(r) != key]
     rows.append(row)
     rows = rows[-MAX_ROWS:]
     LOG_PATH.write_text(json.dumps(rows, indent=2, default=str))
@@ -38,7 +79,25 @@ def append_decision(row: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def load_decisions(limit: int = 60) -> list[dict[str, Any]]:
-    rows = _load()
+    url = database_url()
+    if url:
+        with _pg_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT payload FROM paper_decisions
+                ORDER BY id DESC
+                LIMIT %s
+                """,
+                (limit,),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            payload = r["payload"]
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            out.append(dict(payload))
+        return out
+    rows = _load_file()
     return list(reversed(rows[-limit:]))
 
 

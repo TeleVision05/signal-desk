@@ -11,12 +11,15 @@ Live: https://signal-desk-upb4.onrender.com
 ## Architecture
 
 ```text
-Yahoo data → walk-forward HGB → p(up) vs 55% → paper ledger
+Yahoo data → walk-forward HGB → p(up) vs 55% → paper ledger (Postgres)
                                       ↓
                          /api/state  +  email on fill
                                       ↓
                               Signal Desk UI
 ```
+
+Money, fills, equity marks, and decision history live in **Supabase Postgres**
+(`DATABASE_URL`). Without that env var, the backend falls back to local SQLite.
 
 Weekday schedule (ET): pre-open ~9:35, hourly during RTH, after close.  
 GitHub Action `render-wake-sync.yml` wakes the free Render dyno and hits `/api/sync`.
@@ -32,6 +35,7 @@ signal-desk   # http://localhost:8080
 
 | Key | Purpose |
 |-----|---------|
+| `DATABASE_URL` | Supabase Postgres URI (session pooler). Required on Render for durable paper money |
 | `PAPER_CASH` | Starting paper cash (default `1000`) |
 | `CRON_SECRET` | Optional sync auth |
 | `TRADE_ALERT_EMAIL` | Inbox for trade emails |

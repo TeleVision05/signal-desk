@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+
+from .ledger import PaperLedger
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / "data"
@@ -15,30 +16,11 @@ OUT = ROOT / "output"
 STATE_PATH = DATA / "dashboard_state.json"
 SEED_PATH = ROOT / "dashboard" / "seed_state.json"
 PROMO_SEED = ROOT / "dashboard" / "ml_promoted.seed.json"
-DB_PATH = DATA / "paper_ledger.sqlite"
 RUN_ID = "ml-tqqq-hgb-paper-v1"
 
 
 def _ledger_rows(run_id: str = RUN_ID) -> dict:
-    if not DB_PATH.exists():
-        return {"fills": [], "equity": [], "position": None, "run": None}
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    run = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
-    pos = conn.execute("SELECT * FROM positions WHERE run_id=?", (run_id,)).fetchone()
-    fills = conn.execute(
-        "SELECT * FROM fills WHERE run_id=? ORDER BY id ASC", (run_id,)
-    ).fetchall()
-    equity = conn.execute(
-        "SELECT * FROM equity WHERE run_id=? ORDER BY id ASC", (run_id,)
-    ).fetchall()
-    conn.close()
-    return {
-        "run": dict(run) if run else None,
-        "position": dict(pos) if pos else None,
-        "fills": [dict(r) for r in fills],
-        "equity": [dict(r) for r in equity],
-    }
+    return PaperLedger().snapshot(run_id)
 
 
 def _seed() -> dict:
