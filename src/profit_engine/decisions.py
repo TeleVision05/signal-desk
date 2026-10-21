@@ -78,18 +78,29 @@ def append_decision(row: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
-def load_decisions(limit: int = 60) -> list[dict[str, Any]]:
+def load_decisions(limit: int = 60, *, run_id: str | None = None) -> list[dict[str, Any]]:
     url = database_url()
     if url:
         with _pg_conn() as conn:
-            rows = conn.execute(
-                """
-                SELECT payload FROM paper_decisions
-                ORDER BY id DESC
-                LIMIT %s
-                """,
-                (limit,),
-            ).fetchall()
+            if run_id:
+                rows = conn.execute(
+                    """
+                    SELECT payload FROM paper_decisions
+                    WHERE run_id = %s
+                    ORDER BY id DESC
+                    LIMIT %s
+                    """,
+                    (run_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT payload FROM paper_decisions
+                    ORDER BY id DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                ).fetchall()
         out: list[dict[str, Any]] = []
         for r in rows:
             payload = r["payload"]
@@ -98,6 +109,8 @@ def load_decisions(limit: int = 60) -> list[dict[str, Any]]:
             out.append(dict(payload))
         return out
     rows = _load_file()
+    if run_id:
+        rows = [r for r in rows if (r.get("run_id") or RUN_ID) == run_id]
     return list(reversed(rows[-limit:]))
 
 
@@ -107,6 +120,7 @@ def explain_decision(row: dict[str, Any]) -> str:
     thr = float(row.get("threshold") or 0.55)
     signal = row.get("signal")
     action = row.get("action") or "hold"
+    asset = str(row.get("asset") or "TQQQ")
     if p is None:
         base = "Model probability unavailable for this bar."
     else:
@@ -126,8 +140,8 @@ def explain_decision(row: dict[str, Any]) -> str:
             )
     outcomes = {
         "hold": "No trade — kept prior position.",
-        "signal_entry": "Bought TQQQ (entered long).",
-        "signal_exit": "Sold TQQQ (signal flipped flat).",
-        "stop_exit": "Sold TQQQ (stop loss hit).",
+        "signal_entry": f"Bought {asset} (entered long).",
+        "signal_exit": f"Sold {asset} (signal flipped flat).",
+        "stop_exit": f"Sold {asset} (stop loss hit).",
     }
     return f"{base} {outcomes.get(action, action)}"

@@ -130,6 +130,7 @@ def sync_ml_paper(
 
     info = {
         "run_id": run_id,
+        "book": "tqqq",
         "strategy": "ml_TQQQ_hgb_h5_t0.55",
         "signal": want,
         "proba": p,
@@ -144,7 +145,7 @@ def sync_ml_paper(
         "action": action,
         "equity": equity,
         "cash": pos["cash"],
-        "asset": pos["asset"],
+        "asset": pos["asset"] or "TQQQ",
         "shares": pos["shares"],
         "mark": mark,
         "open": open_px,
@@ -154,6 +155,8 @@ def sync_ml_paper(
     info["explanation"] = explain_decision(info)
     append_decision(
         {
+            "run_id": run_id,
+            "book": "tqqq",
             "bar_date": info["bar_date"],
             "synced_at": info["synced_at"],
             "proba": p,
@@ -165,6 +168,7 @@ def sync_ml_paper(
             "equity": equity,
             "cash": pos["cash"],
             "shares": pos["shares"],
+            "asset": info["asset"],
             "mark": mark,
             "explanation": info["explanation"],
         }

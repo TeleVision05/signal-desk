@@ -1,21 +1,25 @@
 name: Wake Render + paper sync
 
-# Keeps the free Render dyno awake around US cash hours and triggers /api/sync
+# Keeps the free Render dyno awake and triggers paper /api/sync
+# - Weekdays: US equity (TQQQ) around cash hours
+# - Every 4h: BTC paper book (24/7)
 on:
   schedule:
-    # ~9:35 ET (13:35 UTC) pre-open / open
+    # ~9:35 ET (13:35 UTC) pre-open / open — TQQQ paper
     - cron: "35 13 * * 1-5"
-    # Hourly during RTH-ish UTC window
+    # Hourly during RTH-ish UTC window — TQQQ paper
     - cron: "10 14,15,16,17,18,19,20 * * 1-5"
-    # After close ~21:20 UTC
+    # After close ~21:20 UTC — TQQQ paper
     - cron: "20 21 * * 1-5"
+    # BTC paper every 4h UTC (incl weekends)
+    - cron: "15 0,4,8,12,16,20 * * *"
   workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Wake + sync Render Signal Desk
+      - name: Wake + sync Render Signal Desk (paper)
         env:
           RENDER_URL: ${{ vars.RENDER_URL }}
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
@@ -23,8 +27,9 @@ jobs:
           set -euo pipefail
           RENDER_URL="${RENDER_URL:-https://signal-desk-upb4.onrender.com}"
           CRON_SECRET="${CRON_SECRET:-signal-desk-paper-sync}"
-          echo "Waking $RENDER_URL ..."
-          # Cold start can take >50s on free tier
+          # Default: sync both paper books. Cron for BTC-only hours can still POST book=all.
+          BOOK="${BOOK:-all}"
+          echo "Waking $RENDER_URL (paper books=$BOOK) ..."
           for i in 1 2 3 4 5 6 7 8; do
             if curl -fsS --max-time 30 "$RENDER_URL/api/health"; then
               echo
@@ -34,8 +39,8 @@ jobs:
             sleep 15
           done
           curl -fsS --max-time 30 "$RENDER_URL/api/health"; echo
-          echo "POST /api/sync"
-          code=$(curl -sS -o /tmp/sync.json -w "%{http_code}" --max-time 600 -X POST "$RENDER_URL/api/sync" \
+          echo "POST /api/sync?book=$BOOK"
+          code=$(curl -sS -o /tmp/sync.json -w "%{http_code}" --max-time 900 -X POST "$RENDER_URL/api/sync?book=$BOOK" \
             -H "X-Cron-Secret: $CRON_SECRET" \
             -H "Content-Type: application/json" || true)
           echo "sync HTTP $code"
@@ -45,4 +50,5 @@ jobs:
             echo "Render sync failed HTTP $code"
             exit 1
           fi
-          curl -fsS --max-time 30 "$RENDER_URL/api/state" | python -c "import sys,json; d=json.load(sys.stdin); p=d.get('paper') or {}; n=d.get('notify') or {}; print('signal', p.get('signal'), 'p', p.get('proba'), 'action', p.get('action'), 'equity', p.get('equity'), 'email_ok', n.get('ok'), 'email_cfg', n.get('configured'))"
+          curl -fsS --max-time 30 "$RENDER_URL/api/state?book=tqqq" | python -c "import sys,json; d=json.load(sys.stdin); p=d.get('paper') or {}; print('TQQQ paper', 'signal', p.get('signal'), 'p', p.get('proba'), 'action', p.get('action'), 'equity', p.get('equity'))"
+          curl -fsS --max-time 30 "$RENDER_URL/api/state?book=btc" | python -c "import sys,json; d=json.load(sys.stdin); p=d.get('paper') or {}; print('BTC paper', 'signal', p.get('signal'), 'p', p.get('proba'), 'action', p.get('action'), 'equity', p.get('equity'))"

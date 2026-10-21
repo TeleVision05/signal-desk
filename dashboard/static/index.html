@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Source+Sans+3:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
-  <link rel="stylesheet" href="/static/styles.css?v=0.5.0" />
+  <link rel="stylesheet" href="/static/styles.css?v=0.6.0" />
 </head>
 <body>
   <div class="atmosphere" aria-hidden="true"></div>
@@ -47,15 +47,19 @@
       <main>
         <!-- SIMPLE -->
         <section id="view-simple" class="view active" aria-label="Simple dashboard">
+          <div class="book-row" role="tablist" aria-label="Paper books">
+            <button type="button" class="book-btn active" data-book="tqqq" role="tab" aria-selected="true">TQQQ paper</button>
+            <button type="button" class="book-btn" data-book="btc" role="tab" aria-selected="false">BTC paper</button>
+          </div>
           <header class="hero">
             <p class="hero-kicker" id="marketLine">Market —</p>
             <h1 class="hero-status" id="heroStatus">Checking…</h1>
             <p class="hero-ticker">
               <span id="heroAsset">TQQQ</span>
-              <button type="button" class="tip-btn" id="tqqqTip" aria-label="What is TQQQ?" title="TQQQ is a fund that aims to move about 3× the daily return of the Nasdaq-100 (big tech stocks). Practice trades only.">?</button>
+              <button type="button" class="tip-btn" id="assetTip" aria-label="What is this asset?" title="Practice paper trading only.">?</button>
             </p>
             <p class="hero-money mono" id="heroEquity">—</p>
-            <p class="hero-money-sub">Fake money in this practice account</p>
+            <p class="hero-money-sub" id="heroMoneySub">Fake money in this practice account</p>
           </header>
 
           <div class="timing-row">
@@ -208,6 +212,6 @@
     TQQQ is a fund that aims to move about 3× the daily return of the Nasdaq-100 (big tech stocks). This desk only uses fake money.
   </div>
 
-  <script src="/static/app.js?v=0.5.0"></script>
+  <script src="/static/app.js?v=0.6.0"></script>
 </body>
 </html>

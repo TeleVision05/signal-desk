@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
+import requests
 import yfinance as yf
 
 DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "cache"
+BINANCE_KLINES_HOSTS = (
+    "https://api.binance.us/api/v3/klines",  # US-reachable first
+    "https://api.binance.com/api/v3/klines",
+)
 
 
 def _ensure_dir() -> Path:
@@ -62,6 +68,141 @@ def fetch_ohlcv(
                 "fetched_at": datetime.now(timezone.utc).isoformat(),
                 "rows": int(len(df)),
                 "source": "yfinance/yahoo",
+            },
+            indent=2,
+        )
+    )
+    return df
+
+
+def _yahoo_crypto_symbol(symbol: str) -> str:
+    """Map Binance-style symbols to Yahoo tickers for paper-price fallback."""
+    s = symbol.upper().replace("/", "")
+    mapping = {
+        "BTCUSDT": "BTC-USD",
+        "BTCUSD": "BTC-USD",
+        "ETHUSDT": "ETH-USD",
+        "ETHUSD": "ETH-USD",
+    }
+    return mapping.get(s, s)
+
+
+def fetch_binance_klines(
+    symbol: str = "BTCUSDT",
+    *,
+    interval: str = "1d",
+    start: str = "2018-01-01",
+    end: str | None = None,
+) -> pd.DataFrame:
+    """Public crypto daily OHLCV for the paper book (no live trading).
+
+    Tries Binance.US / Binance klines; on geo-blocks (e.g. HTTP 451) falls back to
+    Yahoo BTC-USD / ETH-USD. Prices are for paper fills only.
+    """
+    if interval != "1d":
+        raise ValueError("Only daily (1d) bars are supported for the paper crypto book")
+    end = end or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    cache = _ensure_dir() / f"crypto_{symbol}_{interval}_{start}_{end}.csv"
+    meta_path = cache.with_suffix(".meta.json")
+    if cache.exists():
+        df = pd.read_csv(cache, parse_dates=["Date"], index_col="Date")
+        return df
+
+    start_ms = int(pd.Timestamp(start, tz="UTC").timestamp() * 1000)
+    end_ms = int(pd.Timestamp(end, tz="UTC").timestamp() * 1000)
+    rows: list[list] = []
+    source = "binance/klines"
+    session = requests.Session()
+    session.headers.update({"User-Agent": "SignalDesk/0.6-paper"})
+    last_err: Exception | None = None
+
+    for host in BINANCE_KLINES_HOSTS:
+        rows = []
+        cursor = start_ms
+        try:
+            while cursor < end_ms:
+                resp = session.get(
+                    host,
+                    params={
+                        "symbol": symbol.upper(),
+                        "interval": interval,
+                        "startTime": cursor,
+                        "endTime": end_ms,
+                        "limit": 1000,
+                    },
+                    timeout=45,
+                )
+                if resp.status_code in (418, 429):
+                    time.sleep(2)
+                    continue
+                if resp.status_code == 451:
+                    raise RuntimeError(f"{host} returned 451 (geo-blocked)")
+                resp.raise_for_status()
+                batch = resp.json()
+                if not batch:
+                    break
+                rows.extend(batch)
+                last_open = int(batch[-1][0])
+                nxt = last_open + 1
+                if nxt <= cursor:
+                    break
+                cursor = nxt
+                if len(batch) < 1000:
+                    break
+                time.sleep(0.15)
+            if rows:
+                source = host
+                break
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            rows = []
+            continue
+
+    if rows:
+        df = pd.DataFrame(
+            rows,
+            columns=[
+                "open_time",
+                "Open",
+                "High",
+                "Low",
+                "Close",
+                "Volume",
+                "close_time",
+                "quote_volume",
+                "trades",
+                "taker_buy_base",
+                "taker_buy_quote",
+                "ignore",
+            ],
+        )
+        for col in ("Open", "High", "Low", "Close", "Volume"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["Date"] = pd.to_datetime(df["open_time"], unit="ms", utc=True).dt.tz_localize(None)
+        df = df.set_index("Date")[["Open", "High", "Low", "Close", "Volume"]]
+        df = df[~df.index.duplicated(keep="last")].sort_index().dropna(subset=["Close"])
+    else:
+        # US-friendly paper fallback: Yahoo crypto (weekend bars included)
+        yahoo = _yahoo_crypto_symbol(symbol)
+        print(f"[crypto] Binance klines unavailable ({last_err}); Yahoo {yahoo}", flush=True)
+        df = fetch_ohlcv(yahoo, start=start, end=end)
+        source = f"yfinance/{yahoo}"
+
+    if df.empty:
+        raise RuntimeError(f"No crypto OHLCV for {symbol} ({start}→{end})")
+
+    df.to_csv(cache)
+    meta_path.write_text(
+        json.dumps(
+            {
+                "symbol": symbol,
+                "interval": interval,
+                "start": start,
+                "end": end,
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+                "rows": int(len(df)),
+                "source": source,
+                "paper_only": True,
             },
             indent=2,
         )

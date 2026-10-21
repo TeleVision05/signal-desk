@@ -2,6 +2,7 @@ const $ = (id) => document.getElementById(id);
 let chart;
 const DEFAULT_CASH = 1000;
 const POLL_MS = 30_000;
+const BOOK_KEY = "sd_book";
 
 function fmtMoney(n) {
   if (n == null || Number.isNaN(Number(n))) return "—";
@@ -59,13 +60,36 @@ function confBucket(p, thr) {
   if (p >= thr - 0.1) return { label: "Maybe", key: "maybe" };
   return { label: "Low", key: "low" };
 }
-function updateLogLine(d) {
+function currentBook() {
+  try {
+    return localStorage.getItem(BOOK_KEY) || "tqqq";
+  } catch (_) {
+    return "tqqq";
+  }
+}
+function setBook(id) {
+  const book = id === "btc" ? "btc" : "tqqq";
+  try {
+    localStorage.setItem(BOOK_KEY, book);
+  } catch (_) {}
+  document.querySelectorAll(".book-btn").forEach((btn) => {
+    const on = btn.dataset.book === book;
+    btn.classList.toggle("active", on);
+    btn.setAttribute("aria-selected", on ? "true" : "false");
+  });
+  return book;
+}
+function assetName(state) {
+  return (state.paper && state.paper.asset) || (state.strategy && state.strategy.ticker) || "TQQQ";
+}
+function updateLogLine(d, asset) {
+  const a = asset || d.asset || "TQQQ";
   const action = d.action || "hold";
-  if (action === "signal_entry") return "Bought TQQQ — confidence was high enough.";
-  if (action === "signal_exit") return "Sold TQQQ — confidence dropped.";
-  if (action === "stop_exit") return "Sold TQQQ — stop loss triggered.";
-  if (d.signal === 1) return "Checked market — still invested (no new trade).";
-  return "Checked market — still in cash (no new trade).";
+  if (action === "signal_entry") return `Bought ${a} (paper) — confidence was high enough.`;
+  if (action === "signal_exit") return `Sold ${a} (paper) — confidence dropped.`;
+  if (action === "stop_exit") return `Sold ${a} (paper) — stop loss triggered.`;
+  if (d.signal === 1) return "Checked market — still invested (no new paper trade).";
+  return "Checked market — still in cash (no new paper trade).";
 }
 
 function setView(name) {
@@ -93,8 +117,18 @@ function bindNav() {
   setView(start === "advanced" ? "advanced" : "simple");
 }
 
+function bindBooks() {
+  document.querySelectorAll(".book-btn").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      setBook(btn.dataset.book);
+      await refresh();
+    });
+  });
+  setBook(currentBook());
+}
+
 function bindTooltip() {
-  const btn = $("tqqqTip");
+  const btn = $("assetTip");
   const pop = $("tipPop");
   if (!btn || !pop) return;
   const place = () => {
@@ -126,7 +160,10 @@ function tickClock() {
 }
 
 async function loadState() {
-  const res = await fetch(`/api/state?t=${Date.now()}`, { cache: "no-store" });
+  const book = currentBook();
+  const res = await fetch(`/api/state?book=${encodeURIComponent(book)}&t=${Date.now()}`, {
+    cache: "no-store",
+  });
   if (!res.ok) throw new Error(`Could not load desk (${res.status})`);
   return res.json();
 }
@@ -141,6 +178,8 @@ function renderSimple(state) {
   const p = paper.proba != null ? Number(paper.proba) : null;
   const shares = Number(paper.shares ?? pos.shares ?? 0);
   const invested = shares > 0 || paper.signal === 1;
+  const asset = assetName(state);
+  const isBtc = state.active_book === "btc";
 
   let equity = null;
   if (paper.equity != null) equity = Number(paper.equity);
@@ -150,16 +189,33 @@ function renderSimple(state) {
     equity = DEFAULT_CASH;
   }
 
-  $("marketLine").textContent =
-    state.market_open_et === true
-      ? "US market is open"
-      : state.market_open_et === false
-        ? "US market is closed"
-        : "Market status unknown";
+  if (isBtc) {
+    $("marketLine").textContent = "BTC paper book · 24/7 (fake money)";
+  } else {
+    $("marketLine").textContent =
+      state.market_open_et === true
+        ? "US market is open · TQQQ paper"
+        : state.market_open_et === false
+          ? "US market is closed · TQQQ paper"
+          : "TQQQ paper book";
+  }
 
   $("heroStatus").textContent = invested ? "We're currently invested" : "We're sitting in cash";
-  $("heroAsset").textContent = paper.asset || pos.asset || "TQQQ";
+  $("heroAsset").textContent = asset;
   $("heroEquity").textContent = fmtMoney(equity);
+  if ($("heroMoneySub")) {
+    $("heroMoneySub").textContent = isBtc
+      ? "Fake money — BTC paper book (no live exchange orders)"
+      : "Fake money in this practice account";
+  }
+
+  const tip = state.book_tip || (isBtc
+    ? "BTCUSDT paper book uses Binance public prices and simulates fills in our ledger. No live crypto orders."
+    : "TQQQ is a fund that aims to move about 3× the daily return of the Nasdaq-100. Practice trades only.");
+  const tipBtn = $("assetTip");
+  const tipPop = $("tipPop");
+  if (tipBtn) tipBtn.title = tip;
+  if (tipPop) tipPop.textContent = tip;
 
   $("lastUpdate").textContent = fmtWhen(paper.synced_at || state.last_sync_at);
   $("nextUpdate").textContent = fmtWhen(state.next_sync_at);
@@ -169,13 +225,13 @@ function renderSimple(state) {
     emailEl.textContent = "Trade emails: not set up";
     emailEl.className = "email-line warn";
   } else if (notify.ok) {
-    emailEl.textContent = "Trade emails: working";
+    emailEl.textContent = "Paper trade emails: working";
     emailEl.className = "email-line ok";
   } else if (notify.error && !String(notify.error).startsWith("skipped")) {
     emailEl.textContent = `Trade emails: issue (${notify.error})`;
     emailEl.className = "email-line warn";
   } else {
-    emailEl.textContent = "Trade emails: working";
+    emailEl.textContent = "Paper trade emails: working";
     emailEl.className = "email-line ok";
   }
 
@@ -190,18 +246,18 @@ function renderSimple(state) {
   } else {
     const pct = (p * 100).toFixed(1);
     const thrPct = (thr * 100).toFixed(0);
-    $("confSentence").textContent = `Bot is ${pct}% sure prices go up; it buys above ${thrPct}%.`;
+    $("confSentence").textContent = `Bot is ${pct}% sure prices go up; it paper-buys above ${thrPct}%.`;
     const left = Math.max(0, Math.min(100, p * 100));
     $("confFill").style.width = `${left}%`;
     $("confMarker").style.left = `${left}%`;
     if (paper.action === "signal_entry") {
-      $("confAction").textContent = "Last move: bought because confidence cleared the bar.";
+      $("confAction").textContent = "Last move: paper buy because confidence cleared the bar.";
     } else if (paper.action === "signal_exit") {
-      $("confAction").textContent = "Last move: sold because confidence dropped.";
+      $("confAction").textContent = "Last move: paper sell because confidence dropped.";
     } else if (paper.action === "stop_exit") {
-      $("confAction").textContent = "Last move: sold on a stop loss to limit damage.";
+      $("confAction").textContent = "Last move: paper sell on a stop loss to limit damage.";
     } else if (invested) {
-      $("confAction").textContent = "Holding the position — no new trade this update.";
+      $("confAction").textContent = "Holding the paper position — no new trade this update.";
     } else {
       $("confAction").textContent = "Staying in cash until confidence is High.";
     }
@@ -222,7 +278,7 @@ function renderSimple(state) {
           </tr>`;
         })
         .join("")
-    : `<tr><td colspan="4">No trades yet — the bot is waiting for a High confidence signal.</td></tr>`;
+    : `<tr><td colspan="4">No paper trades yet — the bot is waiting for a High confidence signal.</td></tr>`;
 
   const log = decisions.slice(0, 10);
   $("updateLog").innerHTML = log.length
@@ -230,7 +286,7 @@ function renderSimple(state) {
         .map(
           (d) => `<li>
             <time datetime="${d.synced_at || ""}">${fmtWhen(d.synced_at)}</time>
-            <span>${updateLogLine(d)}</span>
+            <span>${updateLogLine(d, asset)}</span>
           </li>`
         )
         .join("")
@@ -240,7 +296,7 @@ function renderSimple(state) {
     .map((e) => ({ date: String(e.ts || "").slice(0, 10), equity: Number(e.equity) }))
     .filter((e) => e.date && !Number.isNaN(e.equity));
   $("chartHint").textContent = liveEq.length
-    ? "Fake money over time (practice account)"
+    ? `Fake money over time (${isBtc ? "BTC" : "TQQQ"} paper account)`
     : "No paper marks yet — chart fills in after updates";
   try {
     drawChart(liveEq);
@@ -256,17 +312,21 @@ function renderAdvanced(state) {
   const promo = state.promoted_metrics || {};
   const decisions = state.decisions || [];
   const notify = state.notify || {};
+  const isBtc = state.active_book === "btc";
 
   const l3m = promo.l3m_return ?? promo.last3m_1k?.return;
   const l3mProfit = promo.l3m_profit ?? promo.last3m_1k?.profit;
-  if (l3m != null) {
+  if (!isBtc && l3m != null) {
     $("m3m").textContent = `${l3m >= 0 ? "+" : ""}${fmtPct(l3m)}`;
     $("m3m").className = `mono ${l3m >= 0 ? "up" : "down"}`;
   } else {
-    $("m3m").textContent = "—";
+    $("m3m").textContent = isBtc ? "paper only" : "—";
+    $("m3m").className = "mono";
   }
 
   const card = [
+    ["Book", isBtc ? "BTC paper (24/7)" : "TQQQ paper (US RTH)"],
+    ["Mode", "paper_only — no live orders"],
     ["Name", strat.name || "—"],
     ["Ticker", strat.ticker || "TQQQ"],
     ["Model", strat.model || "HGB"],
@@ -276,6 +336,7 @@ function renderAdvanced(state) {
     ["Trail stop", fmtPct(strat.trailing_stop_pct ?? 0.12)],
     ["Train window", `${strat.train_days ?? 504} days / fold`],
   ];
+  if (strat.cost_bps != null) card.push(["Cost model", `${strat.cost_bps} bps (paper)`]);
   $("strategyCard").innerHTML = card.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
   $("featureList").innerHTML = (strat.features || []).map((f) => `<span>${f}</span>`).join("");
 
@@ -303,7 +364,7 @@ function renderAdvanced(state) {
           </tr>`;
         })
         .join("")
-    : `<tr><td colspan="10">No decisions yet.</td></tr>`;
+    : `<tr><td colspan="10">No paper decisions yet.</td></tr>`;
 
   const fills = ((state.ledger && state.ledger.fills) || []).slice().reverse();
   $("fillsBody").innerHTML = fills.length
@@ -313,28 +374,38 @@ function renderAdvanced(state) {
             <td>${fmtWhen(f.ts)}</td>
             <td class="${String(f.side || "").toLowerCase() === "buy" ? "buy" : "sell"}">${f.side}</td>
             <td>${f.source || "—"}</td>
-            <td>${fmtNum(f.shares, 4)}</td>
+            <td>${fmtNum(f.shares, 6)}</td>
             <td>${fmtMoney(f.price)}</td>
             <td>${fmtMoney(f.cost)}</td>
           </tr>`
         )
         .join("")
-    : `<tr><td colspan="6">No fills yet.</td></tr>`;
+    : `<tr><td colspan="6">No paper fills yet.</td></tr>`;
 
-  const metrics = [
-    ["Full CAGR", fmtPct(promo.cagr)],
-    ["Last 3y CAGR", fmtPct(promo.l3y_cagr)],
-    ["vs SPY (3y)", fmtPct(promo.l3y_excess_cagr_vs_spy)],
-    ["Max DD", fmtPct(promo.max_drawdown ?? promo.l3y_max_drawdown)],
-    ["Green weeks", fmtPct(promo.positive_week_pct)],
-    ["3m $1k P&L", l3mProfit != null ? fmtMoney(l3mProfit) : "—"],
-  ];
+  const metrics = isBtc
+    ? [
+        ["Mode", "paper_only"],
+        ["Data", "Binance public klines"],
+        ["Fills", "Local Postgres ledger"],
+        ["Live orders", "None"],
+        ["Starting cash", fmtMoney(DEFAULT_CASH)],
+        ["Last mark", paper.mark != null ? fmtMoney(paper.mark) : "—"],
+      ]
+    : [
+        ["Full CAGR", fmtPct(promo.cagr)],
+        ["Last 3y CAGR", fmtPct(promo.l3y_cagr)],
+        ["vs SPY (3y)", fmtPct(promo.l3y_excess_cagr_vs_spy)],
+        ["Max DD", fmtPct(promo.max_drawdown ?? promo.l3y_max_drawdown)],
+        ["Green weeks", fmtPct(promo.positive_week_pct)],
+        ["3m $1k P&L", l3mProfit != null ? fmtMoney(l3mProfit) : "—"],
+      ];
   $("promoMetrics").innerHTML = metrics
     .map(([k, v]) => `<div><span>${k}</span><strong>${v}</strong></div>`)
     .join("");
 
   $("genAt").textContent = [
     `State ${state.generated_at || "—"}`,
+    `book ${state.active_book || "tqqq"}`,
     `mode ${state.mode || "paper"}`,
     state.last_sync_reason || "no sync",
     `v${state.version || "—"}`,
@@ -395,7 +466,7 @@ function drawChart(series) {
 }
 
 function render(state) {
-  if ($("sideVersion")) $("sideVersion").textContent = `v${state.version || "0.5.0"}`;
+  if ($("sideVersion")) $("sideVersion").textContent = `v${state.version || "0.6.0"}`;
   renderSimple(state);
   renderAdvanced(state);
 }
@@ -412,6 +483,7 @@ async function refresh() {
 
 async function boot() {
   bindNav();
+  bindBooks();
   bindTooltip();
   tickClock();
   setInterval(tickClock, 1000);

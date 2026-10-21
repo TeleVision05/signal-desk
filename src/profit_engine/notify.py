@@ -43,13 +43,17 @@ def _subject(info: dict[str, Any]) -> str:
         "signal_exit": "SELL",
         "stop_exit": "STOP SELL",
     }.get(action, action.upper())
-    return f"[Signal Desk] {side} TQQQ paper trade"
+    asset = str(info.get("asset") or "TQQQ")
+    return f"[Signal Desk] PAPER {side} {asset}"
 
 
 def _body(info: dict[str, Any]) -> str:
     lines = [
-        "Paper trade executed on Signal Desk.",
+        "PAPER trade only — no live exchange or broker orders.",
+        "Fake money was updated in the Signal Desk ledger.",
         "",
+        f"Book:        {info.get('book') or '—'} (paper)",
+        f"Asset:       {info.get('asset') or '—'}",
         f"Action:      {info.get('action')}",
         f"Signal:      {info.get('signal')}",
         f"p(up):       {info.get('proba')}",
