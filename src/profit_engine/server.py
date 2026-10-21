@@ -110,7 +110,7 @@ async def lifespan(app: FastAPI):
         _scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Signal Desk", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Signal Desk", version="0.3.1", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -133,9 +133,14 @@ def health():
         "utc": datetime.now(timezone.utc).isoformat(),
         "et": datetime.now(ET).isoformat(),
         "market_open_et": _us_equity_session_open(),
-        "version": "0.3.0",
+        "version": "0.3.1",
         "allow_public_sync": ALLOW_PUBLIC_SYNC,
         "trade_alerts": os.environ.get("TRADE_ALERTS", "1") == "1",
+        "notify_ready": bool(
+            os.environ.get("RESEND_API_KEY")
+            or (os.environ.get("SMTP_HOST") and os.environ.get("SMTP_USER") and os.environ.get("SMTP_PASS"))
+            or os.environ.get("NTFY_TOPIC")
+        ),
     }
 
 
@@ -166,11 +171,11 @@ def config():
 
 @app.post("/api/test-alert")
 def test_alert(x_cron_secret: str | None = Header(default=None)):
-    """Send a sample trade email so FormSubmit/SMTP can be activated."""
+    """Send a sample trade alert and return delivery status."""
     authed = x_cron_secret == CRON_SECRET or ALLOW_PUBLIC_SYNC
     if not authed:
         raise HTTPException(status_code=401, detail="invalid cron secret")
-    from .notify import send_trade_alert
+    from .notify import load_notify_status, send_trade_alert
 
     sample = {
         "run_id": "ml-tqqq-hgb-paper-v1",
@@ -185,8 +190,8 @@ def test_alert(x_cron_secret: str | None = Header(default=None)):
         "mark": 70.4,
         "synced_at": datetime.now(timezone.utc).isoformat(),
     }
-    send_trade_alert(sample)
-    return {"ok": True, "emailed": sample}
+    delivery = send_trade_alert(sample)
+    return {"ok": bool(delivery.get("ok")), "emailed": sample, "delivery": delivery, "last": load_notify_status()}
 
 
 @app.get("/")

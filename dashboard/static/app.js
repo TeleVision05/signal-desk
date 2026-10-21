@@ -253,7 +253,13 @@ function render(state) {
   $("promoMetrics").innerHTML = metrics
     .map(([k, v]) => `<div><span>${k}</span><strong>${v}</strong></div>`)
     .join("");
-  $("genAt").textContent = `State generated ${state.generated_at || "—"} · mode ${state.mode || "paper"} · ${state.last_sync_reason || "no sync yet"}`;
+  const notify = state.notify || {};
+  const notifyLine = notify.ok
+    ? `alerts ok via ${notify.via} → ${notify.to || ""}`
+    : notify.error
+      ? `alerts NOT delivering: ${notify.error}`
+      : "alerts not tested yet";
+  $("genAt").textContent = `State generated ${state.generated_at || "—"} · mode ${state.mode || "paper"} · ${state.last_sync_reason || "no sync yet"} · ${notifyLine}`;
 
   const liveEq = ((state.ledger && state.ledger.equity) || [])
     .map((e) => ({ date: String(e.ts || "").slice(0, 10), equity: Number(e.equity) }))

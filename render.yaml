@@ -16,5 +16,15 @@ services:
         value: "1"
       - key: TRADE_ALERT_EMAIL
         value: tarun.vadapalli.1@gmail.com
+      # Instant phone/desktop push (open https://ntfy.sh/signal-desk-tarun )
+      - key: NTFY_TOPIC
+        value: signal-desk-tarun
+      # For Gmail: set SMTP_PASS to a Google App Password (SMTP_USER=your gmail)
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        value: tarun.vadapalli.1@gmail.com
       - key: PYTHONUNBUFFERED
         value: "1"
