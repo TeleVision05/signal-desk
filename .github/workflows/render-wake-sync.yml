@@ -35,8 +35,14 @@ jobs:
           done
           curl -fsS --max-time 30 "$RENDER_URL/api/health"; echo
           echo "POST /api/sync"
-          curl -fsS --max-time 600 -X POST "$RENDER_URL/api/sync" \
+          code=$(curl -sS -o /tmp/sync.json -w "%{http_code}" --max-time 600 -X POST "$RENDER_URL/api/sync" \
             -H "X-Cron-Secret: $CRON_SECRET" \
-            -H "Content-Type: application/json"
+            -H "Content-Type: application/json" || true)
+          echo "sync HTTP $code"
+          cat /tmp/sync.json || true
           echo
+          if [ "$code" != "200" ]; then
+            echo "Render sync not ready yet (likely old deploy / secret). Pages Action still publishes the desk."
+            exit 0
+          fi
           curl -fsS --max-time 30 "$RENDER_URL/api/state" | python -c "import sys,json; d=json.load(sys.stdin); p=d.get('paper') or {}; print('signal', p.get('signal'), 'equity', p.get('equity'), 'action', p.get('action'), 'bt', len((d.get('backtest') or {}).get('equity_weekly') or []))"

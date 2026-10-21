@@ -2,6 +2,11 @@ name: Deploy Signal Desk to GitHub Pages
 
 on:
   schedule:
+    # Pre-open ~9:35 ET
+    - cron: "35 13 * * 1-5"
+    # Mid-session refresh during RTH (UTC)
+    - cron: "15 15,17,19 * * 1-5"
+    # After close ~21:30 UTC
     - cron: "30 21 * * 1-5"
   workflow_dispatch:
   push:
@@ -67,13 +72,7 @@ jobs:
           html = html.replace('src="/static/', 'src="./static/')
           html = html.replace('href="/api/state"', 'href="./state.json"')
           (site / "index.html").write_text(html)
-          js = (site / "static" / "app.js").read_text()
-          # Disable live sync button effect on static hosting — call state refresh only
-          js = js.replace(
-              'const res = await fetch("/api/sync", {\n      method: "POST",\n      headers: { "X-Cron-Secret": secret },\n    });',
-              'const res = { ok: false, status: 501, json: async () => ({ detail: "Live sync runs on the weekday GitHub Action / Render host. This Pages site refreshes after each scheduled run." }) };'
-          )
-          (site / "static" / "app.js").write_text(js)
+          # app.js already targets Render when hosted on github.io; keep sync live.
           (site / "state.json").write_text(json.dumps(state, indent=2, default=str))
           print("site ready")
           PY

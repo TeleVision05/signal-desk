@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -107,6 +108,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Signal Desk", version="0.2.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://television05.github.io",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+    ],
+    allow_origin_regex=r"https://.*\.github\.io",
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/api/health")
@@ -118,6 +131,7 @@ def health():
         "et": datetime.now(ET).isoformat(),
         "market_open_et": _us_equity_session_open(),
         "version": "0.2.0",
+        "allow_public_sync": ALLOW_PUBLIC_SYNC,
     }
 
 

@@ -1,6 +1,12 @@
 const $ = (id) => document.getElementById(id);
 let chart;
 const DEFAULT_CASH = 1000;
+const RENDER_API = "https://signal-desk-upb4.onrender.com";
+
+function apiRoot() {
+  if (window.location.hostname.endsWith("github.io")) return RENDER_API;
+  return "";
+}
 
 function fmtMoney(n) {
   if (n == null || Number.isNaN(Number(n))) return "—";
@@ -24,10 +30,25 @@ function tickClock() {
 }
 
 async function loadState() {
-  const url = window.location.hostname.endsWith("github.io")
-    ? `./state.json?t=${Date.now()}`
-    : `/api/state?t=${Date.now()}`;
-  const res = await fetch(url, { cache: "no-store" });
+  const root = apiRoot();
+  if (root) {
+    try {
+      const live = await fetch(`${root}/api/state?t=${Date.now()}`, { cache: "no-store" });
+      if (live.ok) {
+        const data = await live.json();
+        const bt = (data.backtest && data.backtest.equity_weekly) || [];
+        const paper = data.paper || {};
+        // Prefer live Render when it has real paper/backtest; else fall through to Pages snapshot
+        if (bt.length || paper.equity != null || paper.signal != null) return data;
+      }
+    } catch (_) {
+      /* cold start / CORS — use static snapshot */
+    }
+    const snap = await fetch(`./state.json?t=${Date.now()}`, { cache: "no-store" });
+    if (!snap.ok) throw new Error(`state failed (${snap.status})`);
+    return snap.json();
+  }
+  const res = await fetch(`/api/state?t=${Date.now()}`, { cache: "no-store" });
   if (!res.ok) throw new Error(`state failed (${res.status})`);
   return res.json();
 }
@@ -204,15 +225,26 @@ async function syncNow() {
   btn.textContent = "Syncing…";
   try {
     const secret = window.localStorage.getItem("CRON_SECRET") || "signal-desk-paper-sync";
-    const res = await fetch("/api/sync", {
+    const root = apiRoot();
+    const res = await fetch(`${root}/api/sync`, {
       method: "POST",
       headers: { "X-Cron-Secret": secret },
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      alert(err.detail || `Sync failed (${res.status}). On Render set CRON_SECRET=signal-desk-paper-sync or ALLOW_PUBLIC_SYNC=1, then Manual Deploy.`);
+      // On Pages, refresh from committed snapshot if live sync is still on old Render build
+      if (root) {
+        try {
+          render(await (await fetch(`./state.json?t=${Date.now()}`, { cache: "no-store" })).json());
+        } catch (_) {}
+      }
+      alert(
+        err.detail ||
+          `Sync failed (${res.status}). Redeploy Render to main (ALLOW_PUBLIC_SYNC=1) or wait for the weekday Pages/Action sync.`
+      );
+    } else {
+      render(await loadState());
     }
-    render(await loadState());
   } catch (e) {
     alert(String(e));
   } finally {
