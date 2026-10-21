@@ -1,0 +1,129 @@
+"""Build a JSON snapshot the dashboard can serve without retraining."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[2]
+DATA = ROOT / "data"
+OUT = ROOT / "output"
+STATE_PATH = DATA / "dashboard_state.json"
+SEED_PATH = ROOT / "dashboard" / "seed_state.json"
+DB_PATH = DATA / "paper_ledger.sqlite"
+RUN_ID = "ml-tqqq-hgb-paper-v1"
+
+
+def _ledger_rows(run_id: str = RUN_ID) -> dict:
+    if not DB_PATH.exists():
+        return {"fills": [], "equity": [], "position": None, "run": None}
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    run = conn.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+    pos = conn.execute("SELECT * FROM positions WHERE run_id=?", (run_id,)).fetchone()
+    fills = conn.execute(
+        "SELECT * FROM fills WHERE run_id=? ORDER BY id ASC", (run_id,)
+    ).fetchall()
+    equity = conn.execute(
+        "SELECT * FROM equity WHERE run_id=? ORDER BY id ASC", (run_id,)
+    ).fetchall()
+    conn.close()
+    return {
+        "run": dict(run) if run else None,
+        "position": dict(pos) if pos else None,
+        "fills": [dict(r) for r in fills],
+        "equity": [dict(r) for r in equity],
+    }
+
+
+def build_state(*, include_backtest: bool = True) -> dict:
+    DATA.mkdir(parents=True, exist_ok=True)
+    ledger = _ledger_rows()
+    promoted = {}
+    for promo_path in (OUT / "ml_promoted.json", ROOT / "dashboard" / "ml_promoted.seed.json"):
+        if promo_path.exists():
+            promoted = json.loads(promo_path.read_text())
+            break
+
+    backtest = {}
+    if include_backtest:
+        # Prefer equity CSV from promoted HGB if present
+        eq_csv = OUT / "ml_TQQQ_hgb_h5_t0.55_equity.csv"
+        if not eq_csv.exists():
+            # any matching
+            matches = list(OUT.glob("ml_TQQQ_hgb_h5_t0.55*_equity.csv"))
+            eq_csv = matches[0] if matches else None
+        if eq_csv and eq_csv.exists():
+            eq = pd.read_csv(eq_csv, index_col=0, parse_dates=True).iloc[:, 0]
+            # downsample for chart
+            eq_w = eq.resample("W-FRI").last().dropna()
+            backtest = {
+                "strategy": "ml_TQQQ_hgb_h5_t0.55",
+                "equity_weekly": [
+                    {"date": str(i.date()), "equity": float(v)} for i, v in eq_w.items()
+                ],
+                "start": str(eq.index[0].date()),
+                "end": str(eq.index[-1].date()),
+                "start_equity": float(eq.iloc[0]),
+                "end_equity": float(eq.iloc[-1]),
+                "total_return": float(eq.iloc[-1] / eq.iloc[0] - 1),
+            }
+
+    paper_last = {}
+    pl = OUT / "ml_paper_last.json"
+    if pl.exists():
+        paper_last = json.loads(pl.read_text())
+
+    findings = {}
+    fm = ROOT / "FINDINGS_ML.md"
+    if fm.exists():
+        findings["path"] = str(fm)
+        findings["summary"] = (
+            "Walk-forward HGB on TQQQ, P>=0.55, 8% hard / 12% trail stops. "
+            "Last 3m paper backtest on $1k ≈ +16%."
+        )
+
+    state = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "run_id": RUN_ID,
+        "strategy": {
+            "name": "ml_TQQQ_hgb_h5_t0.55",
+            "ticker": "TQQQ",
+            "model": "HistGradientBoosting",
+            "horizon_days": 5,
+            "proba_threshold": 0.55,
+            "hard_stop_pct": 0.08,
+            "trailing_stop_pct": 0.12,
+            "train_days": 504,
+            "features": [
+                "returns 1/2/3/5/10/20/60d",
+                "vol 10/20 + ratio",
+                "dist to SMA 10/20/50/100/200",
+                "RSI 7/14",
+                "ATR%",
+                "volume z-score",
+                "Donchian 20/55",
+                "SPY/QQQ/VIX cross features",
+            ],
+        },
+        "paper": paper_last,
+        "ledger": ledger,
+        "backtest": backtest,
+        "promoted_metrics": promoted,
+        "findings": findings,
+        "mode": "paper_only",
+    }
+    STATE_PATH.write_text(json.dumps(state, indent=2, default=str))
+    return state
+
+
+def load_state() -> dict:
+    if STATE_PATH.exists():
+        return json.loads(STATE_PATH.read_text())
+    if SEED_PATH.exists():
+        return json.loads(SEED_PATH.read_text())
+    return build_state()

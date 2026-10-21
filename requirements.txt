@@ -1,0 +1,10 @@
+yfinance>=0.2.40
+pandas>=2.2.0
+numpy>=1.26.0
+requests>=2.31.0
+scikit-learn>=1.4.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+apscheduler>=3.10.4
+python-multipart>=0.0.9
+pytest>=8.0.0

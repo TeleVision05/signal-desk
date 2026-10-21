@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Signal Desk — Paper ML</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,600;0,9..40,700;1,9..40,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="atmosphere" aria-hidden="true"></div>
+  <header class="top">
+    <div class="brand">
+      <div class="mark">SD</div>
+      <div>
+        <h1>Signal Desk</h1>
+        <p class="sub">Paper · walk-forward ML · TQQQ</p>
+      </div>
+    </div>
+    <div class="top-meta">
+      <span id="modePill" class="pill">PAPER</span>
+      <span id="clock" class="mono"></span>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero-metrics" id="heroMetrics">
+      <article class="metric">
+        <span class="label">Paper equity</span>
+        <strong id="mEquity" class="mono">—</strong>
+        <em id="mEquitySub">waiting for sync</em>
+      </article>
+      <article class="metric">
+        <span class="label">Signal</span>
+        <strong id="mSignal" class="mono">—</strong>
+        <em id="mSignalSub">model probability</em>
+      </article>
+      <article class="metric">
+        <span class="label">Position</span>
+        <strong id="mPos" class="mono">—</strong>
+        <em id="mPosSub">shares · mark</em>
+      </article>
+      <article class="metric">
+        <span class="label">Last 3m backtest</span>
+        <strong id="m3m" class="mono">—</strong>
+        <em>on $1,000 reference</em>
+      </article>
+    </section>
+
+    <section class="grid-2">
+      <div class="panel">
+        <div class="panel-h">
+          <h2>Equity path</h2>
+          <span class="hint" id="chartHint">weekly marks</span>
+        </div>
+        <canvas id="equityChart" height="120"></canvas>
+      </div>
+      <div class="panel">
+        <div class="panel-h">
+          <h2>Strategy card</h2>
+        </div>
+        <dl class="kv" id="strategyCard"></dl>
+        <div class="features" id="featureList"></div>
+      </div>
+    </section>
+
+    <section class="grid-2">
+      <div class="panel">
+        <div class="panel-h">
+          <h2>Live paper trades</h2>
+          <button id="syncBtn" type="button">Run sync</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>When</th><th>Side</th><th>Reason</th><th>Shares</th><th>Price</th><th>Cost</th></tr>
+            </thead>
+            <tbody id="fillsBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-h">
+          <h2>Key metrics</h2>
+        </div>
+        <div class="metric-grid" id="promoMetrics"></div>
+        <p class="footnote" id="genAt"></p>
+      </div>
+    </section>
+
+    <section class="panel wide">
+      <div class="panel-h">
+        <h2>How to read this desk</h2>
+      </div>
+      <p class="prose">
+        This is <strong>paper money only</strong>. The model is a walk-forward HistGradientBoosting classifier on daily TQQQ features
+        (returns, volatility, SMA distance, RSI, ATR, volume, Donchian, plus SPY/QQQ/VIX). It goes long when predicted probability ≥ 0.55,
+        with an 8% hard stop and 12% trailing stop. The server resyncs on weekdays after the US cash close (21:15 UTC) and whenever you hit Run sync.
+      </p>
+    </section>
+  </main>
+
+  <footer>
+    <span>Signal Desk · TeleVision05</span>
+    <a href="/api/state" target="_blank" rel="noreferrer">raw state JSON</a>
+  </footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "profit-engine"
+version = "0.1.0"
+description = "Paper-only GEM dual-momentum engine with real market data"
+requires-python = ">=3.10"
+dependencies = [
+  "yfinance>=0.2.40",
+  "pandas>=2.2.0",
+  "numpy>=1.26.0",
+  "requests>=2.31.0",
+]
+
+[project.scripts]
+profit-engine = "profit_engine.cli:main"
+signal-desk = "profit_engine.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

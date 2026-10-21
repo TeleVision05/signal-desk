@@ -1,0 +1,130 @@
+"""Paper driver for promoted walk-forward ML TQQQ strategy."""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .daily_backtest import StopConfig, _stop_hit
+from .data import fetch_ohlcv
+from .ledger import PaperLedger
+from .ml_walkforward import WFConfig, run_ml_experiment, walk_forward_signals
+from .features import build_features, make_labels
+
+OUT = Path(__file__).resolve().parents[2] / "output"
+
+# Frozen promoted config (HGB: strong OOS, better DD than logreg max-aggression cell)
+PROMOTED = WFConfig(
+    ticker="TQQQ",
+    model="hgb",
+    horizon=5,
+    proba_threshold=0.55,
+    hard_pct=0.08,
+    trailing_pct=0.12,
+    embargo=5,
+)
+
+
+def sync_ml_paper(
+    run_id: str = "ml-tqqq-hgb-paper-v1",
+    *,
+    initial_cash: float = 1000.0,
+    db_path=None,
+) -> dict:
+    cfg = PROMOTED
+    # Refresh signals via full experiment path pieces
+    qqq = fetch_ohlcv("QQQ", start=cfg.start)
+    spy = fetch_ohlcv("SPY", start=cfg.start)
+    tqqq = fetch_ohlcv("TQQQ", start=max(cfg.start, "2010-02-11"))
+    try:
+        vix = fetch_ohlcv("^VIX", start=cfg.start)["Close"]
+    except Exception:
+        vix = None
+    extras = {"spy": spy["Close"], "qqq": qqq["Close"]}
+    if vix is not None:
+        extras["vix"] = vix
+    feat = build_features(tqqq, extras=extras)
+    y = make_labels(tqqq["Close"], horizon=cfg.horizon, mode=cfg.label_mode)
+    signal, proba = walk_forward_signals(tqqq, feat, y, cfg)
+    want = int(signal.iloc[-1])
+    p = float(proba.iloc[-1]) if not (proba.iloc[-1] != proba.iloc[-1]) else None
+    bar = tqqq.iloc[-1]
+    mark = float(bar["Close"])
+    open_px = float(bar["Open"])
+    ts = tqqq.index[-1].isoformat()
+    stop = StopConfig(hard_pct=cfg.hard_pct, trailing_pct=cfg.trailing_pct)
+    half = cfg.cost_bps / 10_000 / 2
+
+    ledger = PaperLedger(db_path) if db_path else PaperLedger()
+    try:
+        pos = ledger.get_position(run_id)
+    except KeyError:
+        ledger.start_run(
+            run_id,
+            "ml_TQQQ_hgb_h5_t0.55",
+            cfg.__dict__,
+            initial_cash=initial_cash,
+        )
+        pos = ledger.get_position(run_id)
+
+    cash = float(pos["cash"])
+    shares = float(pos["shares"])
+    action = "hold"
+    entry_px = mark
+    if shares > 0:
+        with ledger._conn() as conn:
+            row = conn.execute(
+                "SELECT price FROM fills WHERE run_id=? AND side='BUY' ORDER BY id DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+            if row:
+                entry_px = float(row["price"])
+        peak = max(entry_px, float(bar["High"]))
+        hit, exit_px = _stop_hit(bar, entry_px, peak, stop)
+        if hit and exit_px is not None:
+            cost = shares * exit_px * half
+            ledger.apply_fill(
+                run_id, side="SELL", asset="TQQQ", shares=shares, price=exit_px, cost=cost, source="stop", ts=ts
+            )
+            action = "stop_exit"
+            pos = ledger.get_position(run_id)
+            cash, shares = float(pos["cash"]), float(pos["shares"])
+
+    if shares > 0 and want == 0:
+        cost = shares * open_px * half
+        ledger.apply_fill(
+            run_id, side="SELL", asset="TQQQ", shares=shares, price=open_px, cost=cost, source="ml_signal", ts=ts
+        )
+        action = "signal_exit"
+    elif shares == 0 and want == 1:
+        pos = ledger.get_position(run_id)
+        cash = float(pos["cash"])
+        cost = cash * half
+        new_shares = (cash - cost) / open_px
+        ledger.apply_fill(
+            run_id, side="BUY", asset="TQQQ", shares=new_shares, price=open_px, cost=cost, source="ml_signal", ts=ts
+        )
+        action = "signal_entry"
+
+    pos = ledger.get_position(run_id)
+    mark_px = mark if pos["asset"] == "TQQQ" else None
+    equity = ledger.mark(run_id, mark_price=mark_px or 0.0, source="yfinance", ts=ts)
+
+    # Persist latest summary pointer
+    OUT.mkdir(exist_ok=True)
+    info = {
+        "run_id": run_id,
+        "strategy": "ml_TQQQ_hgb_h5_t0.55",
+        "signal": want,
+        "proba": p,
+        "action": action,
+        "equity": equity,
+        "cash": pos["cash"],
+        "asset": pos["asset"],
+        "shares": pos["shares"],
+        "mark": mark,
+        "synced_at": datetime.now(timezone.utc).isoformat(),
+    }
+    (OUT / "ml_paper_last.json").write_text(json.dumps(info, indent=2))
+    return info
