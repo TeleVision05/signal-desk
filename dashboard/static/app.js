@@ -162,8 +162,18 @@ function render(state) {
   const liveEq = ((state.ledger && state.ledger.equity) || [])
     .map((e) => ({ date: String(e.ts || "").slice(0, 10), equity: Number(e.equity) }))
     .filter((e) => e.date && !Number.isNaN(e.equity));
-  const series = liveEq.length > 1 ? liveEq : bt.equity_weekly || [];
-  $("chartHint").textContent = liveEq.length > 1 ? "paper ledger marks" : "walk-forward backtest (weekly)";
+  const btSeries = bt.equity_weekly || [];
+  // Prefer full walk-forward curve; paper ledger only once it has a real history
+  const usePaperPath =
+    liveEq.length >= 8 &&
+    liveEq[0].date !== liveEq[liveEq.length - 1].date &&
+    btSeries.length === 0;
+  const series = usePaperPath ? liveEq : btSeries.length ? btSeries : liveEq;
+  $("chartHint").textContent = usePaperPath
+    ? "paper ledger marks"
+    : btSeries.length
+      ? "walk-forward backtest (weekly)"
+      : "paper ledger marks";
   try {
     drawChart(series);
   } catch (err) {
