@@ -39,15 +39,34 @@
         <em id="mSignalSub">model probability</em>
       </article>
       <article class="metric">
+        <span class="label">p(up)</span>
+        <strong id="mProba" class="mono">—</strong>
+        <em id="mProbaSub">vs threshold</em>
+      </article>
+      <article class="metric">
         <span class="label">Position</span>
         <strong id="mPos" class="mono">—</strong>
         <em id="mPosSub">shares · mark</em>
       </article>
-      <article class="metric">
-        <span class="label">Last 3m backtest</span>
-        <strong id="m3m" class="mono">—</strong>
-        <em>on $1,000 reference</em>
-      </article>
+    </section>
+
+    <section class="panel wide decision-panel">
+      <div class="panel-h">
+        <h2>Latest comparison</h2>
+        <span class="hint" id="decisionBarHint">p(up) vs 55% threshold</span>
+      </div>
+      <p class="decision-explain" id="decisionExplain">Waiting for first sync…</p>
+      <div class="proba-track" aria-label="Probability versus threshold">
+        <div class="proba-fill" id="probaFill"></div>
+        <div class="proba-threshold" id="probaThreshold" style="left:55%"></div>
+        <div class="proba-marker" id="probaMarker" style="left:0%"></div>
+      </div>
+      <div class="proba-scale">
+        <span>0%</span>
+        <span id="thrLabel">threshold 55%</span>
+        <span>100%</span>
+      </div>
+      <div class="decision-stats" id="decisionStats"></div>
     </section>
 
     <section class="grid-2">
@@ -61,9 +80,38 @@
       <div class="panel">
         <div class="panel-h">
           <h2>Strategy card</h2>
+          <span class="hint" id="m3mHint">3m backtest</span>
         </div>
+        <p class="backtest-chip"><span>Last 3m</span><strong id="m3m" class="mono">—</strong></p>
         <dl class="kv" id="strategyCard"></dl>
         <div class="features" id="featureList"></div>
+      </div>
+    </section>
+
+    <section class="panel wide">
+      <div class="panel-h">
+        <h2>Decision log</h2>
+        <button id="syncBtn" type="button">Run sync</button>
+      </div>
+      <p class="footnote tight">Each row is one sync: model p(up), the 55% threshold comparison, signal, and what the paper book did.</p>
+      <div class="table-wrap tall">
+        <table>
+          <thead>
+            <tr>
+              <th>Synced</th>
+              <th>Bar</th>
+              <th>p(up)</th>
+              <th>Threshold</th>
+              <th>Gap</th>
+              <th>Result</th>
+              <th>Signal</th>
+              <th>Action</th>
+              <th>Equity</th>
+              <th>What happened</th>
+            </tr>
+          </thead>
+          <tbody id="decisionsBody"></tbody>
+        </table>
       </div>
     </section>
 
@@ -71,7 +119,6 @@
       <div class="panel">
         <div class="panel-h">
           <h2>Live paper trades</h2>
-          <button id="syncBtn" type="button">Run sync</button>
         </div>
         <div class="table-wrap">
           <table>
@@ -96,9 +143,10 @@
         <h2>How to read this desk</h2>
       </div>
       <p class="prose">
-        This is <strong>paper money only</strong>. The model is a walk-forward HistGradientBoosting classifier on daily TQQQ features
-        (returns, volatility, SMA distance, RSI, ATR, volume, Donchian, plus SPY/QQQ/VIX). It goes long when predicted probability ≥ 0.55,
-        with an 8% hard stop and 12% trailing stop. The server resyncs on weekdays after the US cash close (21:15 UTC) and whenever you hit Run sync.
+        This is <strong>paper money only</strong>. Each sync recomputes walk-forward HistGradientBoosting
+        probability that TQQQ rises over the next ~5 days. If <strong>p(up) ≥ 55%</strong> the signal is LONG;
+        otherwise FLAT. The paper book then buys, sells, hits a stop, or holds. The decision log keeps every
+        comparison so you can see the percentage and what happened. Syncs run weekdays around open, hourly in RTH, after close, or via Run sync.
       </p>
     </section>
   </main>

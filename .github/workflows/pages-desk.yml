@@ -44,7 +44,7 @@ jobs:
           try:
               from profit_engine.paper_ml import sync_ml_paper
               info = sync_ml_paper(initial_cash=1000.0)
-              print("sync ok", {k: info.get(k) for k in ("equity","signal","action")})
+              print("sync ok", {k: info.get(k) for k in ("equity","signal","action","proba","comparison")})
           except Exception as e:
               print("sync skipped:", e)
               traceback.print_exc()

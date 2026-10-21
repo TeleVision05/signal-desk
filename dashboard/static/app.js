@@ -20,9 +20,32 @@ function fmtPct(n) {
   if (n == null || Number.isNaN(Number(n))) return "—";
   return `${(Number(n) * 100).toFixed(2)}%`;
 }
+function fmtPct1(n) {
+  if (n == null || Number.isNaN(Number(n))) return "—";
+  return `${(Number(n) * 100).toFixed(1)}%`;
+}
+function fmtPts(n) {
+  if (n == null || Number.isNaN(Number(n))) return "—";
+  const v = Number(n) * 100;
+  return `${v >= 0 ? "+" : ""}${v.toFixed(1)} pts`;
+}
 function fmtNum(n, d = 2) {
   if (n == null || Number.isNaN(Number(n))) return "—";
   return Number(n).toFixed(d);
+}
+function fmtTs(s) {
+  if (!s) return "—";
+  return String(s).replace("T", " ").slice(0, 16) + "Z";
+}
+function actionLabel(a) {
+  return (
+    {
+      hold: "HOLD",
+      signal_entry: "BUY",
+      signal_exit: "SELL",
+      stop_exit: "STOP SELL",
+    }[a] || String(a || "—").toUpperCase()
+  );
 }
 
 function tickClock() {
@@ -38,8 +61,8 @@ async function loadState() {
         const data = await live.json();
         const bt = (data.backtest && data.backtest.equity_weekly) || [];
         const paper = data.paper || {};
-        // Prefer live Render when it has real paper/backtest; else fall through to Pages snapshot
-        if (bt.length || paper.equity != null || paper.signal != null) return data;
+        const decisions = data.decisions || [];
+        if (bt.length || paper.equity != null || paper.signal != null || decisions.length) return data;
       }
     } catch (_) {
       /* cold start / CORS — use static snapshot */
@@ -53,12 +76,64 @@ async function loadState() {
   return res.json();
 }
 
+function renderComparison(paper, strat) {
+  const thr = Number(paper.threshold ?? strat.proba_threshold ?? 0.55);
+  const p = paper.proba != null ? Number(paper.proba) : null;
+  const pass = p != null && p >= thr;
+
+  $("thrLabel").textContent = `threshold ${(thr * 100).toFixed(0)}%`;
+  $("probaThreshold").style.left = `${thr * 100}%`;
+
+  if (p == null) {
+    $("mProba").textContent = "—";
+    $("mProba").className = "mono";
+    $("mProbaSub").textContent = `need ≥ ${fmtPct1(thr)} to go long`;
+    $("probaFill").style.width = "0%";
+    $("probaFill").className = "proba-fill";
+    $("probaMarker").style.left = "0%";
+    $("decisionExplain").textContent =
+      paper.explanation ||
+      "No probability on this bar yet — run sync after the model covers the latest day.";
+    $("decisionBarHint").textContent = "p(up) unavailable";
+  } else {
+    $("mProba").textContent = fmtPct1(p);
+    $("mProba").className = `mono ${pass ? "up" : "down"}`;
+    $("mProbaSub").textContent = pass
+      ? `${fmtPts(p - thr)} over ${fmtPct1(thr)} threshold`
+      : `${fmtPts(p - thr)} under ${fmtPct1(thr)} threshold`;
+    $("probaFill").style.width = `${Math.max(0, Math.min(100, p * 100))}%`;
+    $("probaFill").className = `proba-fill ${pass ? "" : "fail"}`.trim();
+    $("probaMarker").style.left = `${Math.max(0, Math.min(100, p * 100))}%`;
+    $("decisionExplain").textContent =
+      paper.explanation ||
+      (pass
+        ? `p(up)=${fmtPct1(p)} cleared the ${fmtPct1(thr)} bar → LONG.`
+        : `p(up)=${fmtPct1(p)} missed the ${fmtPct1(thr)} bar → FLAT.`);
+    $("decisionBarHint").textContent = `bar ${paper.bar_date || "—"} · ${pass ? "PASS" : "FAIL"}`;
+  }
+
+  const stats = [
+    ["p(up)", p == null ? "—" : fmtPct1(p), pass ? "pass" : p == null ? "" : "fail"],
+    ["Threshold", fmtPct1(thr), ""],
+    ["Gap", p == null ? "—" : fmtPts(p - thr), pass ? "pass" : p == null ? "" : "fail"],
+    ["Signal", paper.signal === 1 ? "LONG" : paper.signal === 0 ? "FLAT" : "—", ""],
+    ["Action", actionLabel(paper.action), ""],
+  ];
+  $("decisionStats").innerHTML = stats
+    .map(
+      ([k, v, cls]) =>
+        `<div><span>${k}</span><strong class="${cls}">${v}</strong></div>`
+    )
+    .join("");
+}
+
 function render(state) {
   const paper = state.paper || {};
   const pos = (state.ledger && state.ledger.position) || {};
   const strat = state.strategy || {};
   const promo = state.promoted_metrics || {};
   const bt = state.backtest || {};
+  const decisions = state.decisions || [];
 
   let equity = null;
   if (paper.equity != null) equity = Number(paper.equity);
@@ -71,9 +146,9 @@ function render(state) {
   $("mEquity").textContent = fmtMoney(equity);
   $("mEquity").className = "mono";
   $("mEquitySub").textContent = paper.synced_at
-    ? `synced ${String(paper.synced_at).replace("T", " ").slice(0, 16)}Z`
+    ? `synced ${fmtTs(paper.synced_at)}`
     : state.last_sync_at
-      ? `last sync ${String(state.last_sync_at).replace("T", " ").slice(0, 16)}Z`
+      ? `last sync ${fmtTs(state.last_sync_at)}`
       : "waiting for first paper sync";
 
   const sig = paper.signal;
@@ -87,20 +162,19 @@ function render(state) {
     $("mSignal").textContent = "—";
     $("mSignal").className = "mono";
   }
-  $("mSignalSub").textContent =
-    paper.proba != null
-      ? `p(up)=${fmtNum(paper.proba, 3)}`
-      : paper.action
-        ? `last action: ${paper.action}`
-        : "awaiting probability";
+  $("mSignalSub").textContent = paper.action
+    ? `last action: ${actionLabel(paper.action)}`
+    : "awaiting sync";
 
-  if (pos.asset) {
-    $("mPos").textContent = pos.asset;
-    $("mPosSub").textContent = `${fmtNum(pos.shares, 4)} sh · mark ${fmtMoney(paper.mark)}`;
+  if (pos.asset || (paper.shares && Number(paper.shares) > 0)) {
+    $("mPos").textContent = paper.asset || pos.asset || "TQQQ";
+    $("mPosSub").textContent = `${fmtNum(paper.shares ?? pos.shares, 4)} sh · mark ${fmtMoney(paper.mark)}`;
   } else {
     $("mPos").textContent = "CASH";
-    $("mPosSub").textContent = fmtMoney(pos.cash != null ? pos.cash : equity);
+    $("mPosSub").textContent = fmtMoney(paper.cash != null ? paper.cash : pos.cash != null ? pos.cash : equity);
   }
+
+  renderComparison(paper, strat);
 
   const l3m = promo.l3m_return ?? promo.last3m_1k?.return;
   const l3mProfit = promo.l3m_profit ?? promo.last3m_1k?.profit;
@@ -129,6 +203,28 @@ function render(state) {
     .map((f) => `<span>${f}</span>`)
     .join("");
 
+  $("decisionsBody").innerHTML = decisions.length
+    ? decisions
+        .map((d) => {
+          const pass = d.comparison === "pass" || (d.proba != null && d.proba >= (d.threshold ?? 0.55));
+          const sigCls = d.signal === 1 ? "long" : "flat";
+          return `
+      <tr>
+        <td>${fmtTs(d.synced_at)}</td>
+        <td>${d.bar_date || "—"}</td>
+        <td>${d.proba == null ? "—" : fmtPct1(d.proba)}</td>
+        <td>${fmtPct1(d.threshold ?? 0.55)}</td>
+        <td>${d.gap_to_threshold == null ? "—" : fmtPts(d.gap_to_threshold)}</td>
+        <td><span class="badge ${pass ? "pass" : "fail"}">${pass ? "PASS" : "FAIL"}</span></td>
+        <td><span class="badge ${sigCls}">${d.signal === 1 ? "LONG" : d.signal === 0 ? "FLAT" : "—"}</span></td>
+        <td>${actionLabel(d.action)}</td>
+        <td>${fmtMoney(d.equity)}</td>
+        <td class="wrap">${d.explanation || "—"}</td>
+      </tr>`;
+        })
+        .join("")
+    : `<tr><td colspan="10">No decisions logged yet. Click Run sync (or wait for the next market-hours job) to record p(up) vs threshold.</td></tr>`;
+
   const fills = ((state.ledger && state.ledger.fills) || []).slice().reverse();
   $("fillsBody").innerHTML = fills.length
     ? fills
@@ -144,7 +240,7 @@ function render(state) {
       </tr>`
         )
         .join("")
-    : `<tr><td colspan="6">No paper fills yet. Sync runs on market open / hourly RTH / after close, or click Run sync.</td></tr>`;
+    : `<tr><td colspan="6">No paper fills yet — holds do not create trades.</td></tr>`;
 
   const metrics = [
     ["Full CAGR", fmtPct(promo.cagr)],
@@ -163,7 +259,6 @@ function render(state) {
     .map((e) => ({ date: String(e.ts || "").slice(0, 10), equity: Number(e.equity) }))
     .filter((e) => e.date && !Number.isNaN(e.equity));
   const btSeries = bt.equity_weekly || [];
-  // Prefer full walk-forward curve; paper ledger only once it has a real history
   const usePaperPath =
     liveEq.length >= 8 &&
     liveEq[0].date !== liveEq[liveEq.length - 1].date &&
@@ -242,16 +337,12 @@ async function syncNow() {
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      // On Pages, refresh from committed snapshot if live sync is still on old Render build
       if (root) {
         try {
           render(await (await fetch(`./state.json?t=${Date.now()}`, { cache: "no-store" })).json());
         } catch (_) {}
       }
-      alert(
-        err.detail ||
-          `Sync failed (${res.status}). Redeploy Render to main (ALLOW_PUBLIC_SYNC=1) or wait for the weekday Pages/Action sync.`
-      );
+      alert(err.detail || `Sync failed (${res.status}).`);
     } else {
       render(await loadState());
     }

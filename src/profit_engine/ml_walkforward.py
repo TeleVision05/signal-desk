@@ -83,32 +83,49 @@ def walk_forward_signals(ohlc: pd.DataFrame, feat: pd.DataFrame, y: pd.Series, c
     signal = pd.Series(0, index=ohlc.index, dtype=int)
     proba_s = pd.Series(np.nan, index=ohlc.index)
 
+    def _fit_predict(train_end: int, te_idx, *, feature_frame: pd.DataFrame | None = None) -> None:
+        if train_end < cfg.train_days // 2 or len(te_idx) == 0:
+            return
+        train_start = max(0, train_end - cfg.train_days)
+        tr_idx = idx[train_start:train_end]
+        X_tr, y_tr = X_all.loc[tr_idx], y_all.loc[tr_idx]
+        if y_tr.nunique() < 2 or len(X_tr) < 100:
+            return
+        src = feature_frame if feature_frame is not None else X_all
+        # Features may be missing on the very latest bar; drop those rows
+        X_te = src.reindex(te_idx).dropna(how="any")
+        if X_te.empty:
+            return
+        # Align columns to training features
+        X_te = X_te.reindex(columns=X_all.columns).dropna(how="any")
+        if X_te.empty:
+            return
+        model = _make_model(cfg.model)
+        model.fit(X_tr.values, y_tr.values)
+        p = model.predict_proba(X_te.values)[:, 1]
+        for dt, pi in zip(X_te.index, p):
+            proba_s.loc[dt] = float(pi)
+            signal.loc[dt] = 1 if float(pi) >= cfg.proba_threshold else 0
+
     i = cfg.train_days
     while i + cfg.test_days <= len(idx):
         train_end = i - cfg.embargo
-        if train_end < cfg.train_days // 2:
-            i += cfg.test_days
-            continue
-        train_start = max(0, train_end - cfg.train_days)
-        tr_idx = idx[train_start:train_end]
         te_idx = idx[i : i + cfg.test_days]
-
-        X_tr, y_tr = X_all.loc[tr_idx], y_all.loc[tr_idx]
-        if y_tr.nunique() < 2 or len(X_tr) < 100:
-            i += cfg.test_days
-            continue
-
-        model = _make_model(cfg.model)
-        model.fit(X_tr.values, y_tr.values)
-        X_te = X_all.loc[te_idx]
-        if hasattr(model, "predict_proba"):
-            p = model.predict_proba(X_te.values)[:, 1]
-        else:
-            p = model.predict_proba(X_te.values)[:, 1]
-        for dt, pi in zip(te_idx, p):
-            proba_s.loc[dt] = pi
-            signal.loc[dt] = 1 if pi >= cfg.proba_threshold else 0
+        _fit_predict(train_end, te_idx)
         i += cfg.test_days
+
+    # Cover leftover labeled days through the last labelable bar
+    if i < len(idx):
+        train_end = max(cfg.embargo, i - cfg.embargo)
+        _fit_predict(train_end, idx[i:])
+
+    # Live extension: most recent bars have features but no forward label yet
+    # (horizon days). Score them with the freshest train window so paper has p.
+    feat_live = feat.dropna(how="any")
+    live_idx = feat_live.index[feat_live.index > idx[-1]]
+    if len(live_idx):
+        train_end = len(idx) - cfg.embargo
+        _fit_predict(train_end, live_idx, feature_frame=feat_live)
 
     signal.name = "ml_signal"
     return signal, proba_s

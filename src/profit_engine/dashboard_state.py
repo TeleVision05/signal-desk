@@ -63,6 +63,8 @@ def _merge_seed_defaults(state: dict) -> dict:
         state["paper"] = {}
     if state.get("ledger") is None:
         state["ledger"] = {"fills": [], "equity": [], "position": None, "run": None}
+    if not state.get("decisions"):
+        state["decisions"] = []
     state.setdefault("mode", "paper_only")
     return state
 
@@ -104,6 +106,10 @@ def build_state(*, include_backtest: bool = True) -> dict:
     if pl.exists():
         paper_last = json.loads(pl.read_text())
 
+    from .decisions import load_decisions
+
+    decisions = load_decisions(limit=60)
+
     findings = {}
     fm = ROOT / "FINDINGS_ML.md"
     if fm.exists():
@@ -137,6 +143,7 @@ def build_state(*, include_backtest: bool = True) -> dict:
             ],
         },
         "paper": paper_last,
+        "decisions": decisions,
         "ledger": ledger,
         "backtest": backtest,
         "promoted_metrics": promoted,

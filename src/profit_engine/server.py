@@ -54,8 +54,11 @@ def _run_paper_sync(*, reason: str = "manual") -> dict:
         OUT.mkdir(parents=True, exist_ok=True)
         (OUT / "ml_paper_last.json").write_text(json.dumps(info, indent=2, default=str))
 
+        from .decisions import load_decisions
+
         state = build_state(include_backtest=True)
         state["paper"] = info
+        state["decisions"] = load_decisions(limit=60)
         state["last_sync_at"] = datetime.now(timezone.utc).isoformat()
         state["last_sync_reason"] = reason
         STATE_PATH.write_text(json.dumps(state, indent=2, default=str))
@@ -107,7 +110,7 @@ async def lifespan(app: FastAPI):
         _scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Signal Desk", version="0.2.1", lifespan=lifespan)
+app = FastAPI(title="Signal Desk", version="0.3.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -130,7 +133,7 @@ def health():
         "utc": datetime.now(timezone.utc).isoformat(),
         "et": datetime.now(ET).isoformat(),
         "market_open_et": _us_equity_session_open(),
-        "version": "0.2.1",
+        "version": "0.3.0",
         "allow_public_sync": ALLOW_PUBLIC_SYNC,
         "trade_alerts": os.environ.get("TRADE_ALERTS", "1") == "1",
     }

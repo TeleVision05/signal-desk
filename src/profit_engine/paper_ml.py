@@ -47,8 +47,18 @@ def sync_ml_paper(
     feat = build_features(tqqq, extras=extras)
     y = make_labels(tqqq["Close"], horizon=cfg.horizon, mode=cfg.label_mode)
     signal, proba = walk_forward_signals(tqqq, feat, y, cfg)
-    want = int(signal.iloc[-1])
-    p = float(proba.iloc[-1]) if not (proba.iloc[-1] != proba.iloc[-1]) else None
+    # Prefer the latest bar; if still empty, fall back to last scored day
+    p_raw = proba.iloc[-1]
+    if p_raw == p_raw:  # not NaN
+        want = int(signal.iloc[-1])
+        p = float(p_raw)
+    else:
+        valid = proba.dropna()
+        if len(valid):
+            p = float(valid.iloc[-1])
+            want = int(signal.loc[valid.index[-1]])
+        else:
+            want, p = 0, None
     bar = tqqq.iloc[-1]
     mark = float(bar["Close"])
     open_px = float(bar["Open"])
@@ -70,6 +80,11 @@ def sync_ml_paper(
 
     cash = float(pos["cash"])
     shares = float(pos["shares"])
+    pos_before = {
+        "cash": cash,
+        "shares": shares,
+        "asset": pos.get("asset"),
+    }
     action = "hold"
     entry_px = mark
     if shares > 0:
@@ -113,19 +128,51 @@ def sync_ml_paper(
 
     # Persist latest summary pointer
     OUT.mkdir(exist_ok=True)
+    thr = float(cfg.proba_threshold)
+    gap = (p - thr) if p is not None else None
+    from .decisions import append_decision, explain_decision
+
     info = {
         "run_id": run_id,
         "strategy": "ml_TQQQ_hgb_h5_t0.55",
         "signal": want,
         "proba": p,
+        "threshold": thr,
+        "gap_to_threshold": gap,
+        "comparison": (
+            None
+            if p is None
+            else ("pass" if p >= thr else "fail")
+        ),
+        "bar_date": str(tqqq.index[-1].date()),
         "action": action,
         "equity": equity,
         "cash": pos["cash"],
         "asset": pos["asset"],
         "shares": pos["shares"],
         "mark": mark,
+        "open": open_px,
+        "pos_before": pos_before,
         "synced_at": datetime.now(timezone.utc).isoformat(),
     }
+    info["explanation"] = explain_decision(info)
+    append_decision(
+        {
+            "bar_date": info["bar_date"],
+            "synced_at": info["synced_at"],
+            "proba": p,
+            "threshold": thr,
+            "gap_to_threshold": gap,
+            "comparison": info["comparison"],
+            "signal": want,
+            "action": action,
+            "equity": equity,
+            "cash": pos["cash"],
+            "shares": pos["shares"],
+            "mark": mark,
+            "explanation": info["explanation"],
+        }
+    )
     (OUT / "ml_paper_last.json").write_text(json.dumps(info, indent=2))
     try:
         from .notify import send_trade_alert
