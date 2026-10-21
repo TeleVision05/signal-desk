@@ -1,65 +1,48 @@
-# profit-engine / Signal Desk
+# Signal Desk
 
-Paper-only trading lab + **Signal Desk** web dashboard for the promoted walk-forward **TQQQ ML** book. Uses **real Yahoo Finance / FRED data** and a **fake-money SQLite wallet**. No live orders.
+Paper-only **TQQQ walk-forward ML** system with one deployable host:
 
-## Signal Desk (deployable dashboard)
+1. **Backend** (Render) — syncs the model, executes paper trades, emails on fills  
+2. **Frontend** — same host, live dashboard (polls `/api/state` every 30s)  
+3. **Notifications** — backend emails `TRADE_ALERT_EMAIL` on BUY / SELL / stop  
+
+Live: https://signal-desk-upb4.onrender.com
+
+## Architecture
+
+```text
+Yahoo data → walk-forward HGB → p(up) vs 55% → paper ledger
+                                      ↓
+                         /api/state  +  email on fill
+                                      ↓
+                              Signal Desk UI
+```
+
+Weekday schedule (ET): pre-open ~9:35, hourly during RTH, after close.  
+GitHub Action `render-wake-sync.yml` wakes the free Render dyno and hits `/api/sync`.
+
+## Local run
 
 ```bash
-pip install -e .
-pip install -r requirements.txt
-# optional: build initial JSON state
-python -c "from profit_engine.dashboard_state import build_state; build_state()"
+pip install -r requirements.txt && pip install -e .
 signal-desk   # http://localhost:8080
 ```
 
-Env vars: `PORT`, `PAPER_CASH` (default 1000), `CRON_SECRET` (required for `/api/sync`).
+## Env (Render)
 
-Docker: `docker build -t signal-desk . && docker run -p 8080:8080 -e CRON_SECRET=... signal-desk`
+| Key | Purpose |
+|-----|---------|
+| `PAPER_CASH` | Starting paper cash (default `1000`) |
+| `CRON_SECRET` | Optional sync auth |
+| `TRADE_ALERT_EMAIL` | Inbox for trade emails |
+| `RESEND_API_KEY` | **Preferred** free email (Resend) |
+| `SMTP_HOST` / `SMTP_USER` / `SMTP_PASS` | Or Gmail SMTP + app password |
 
-Deploy target: GitHub repo under **TeleVision05** + Render (`render.yaml`) or any Docker host. Weekday scheduler resyncs paper at 21:15 UTC; GitHub Actions is a backup cron.
-
-This replaces prior local experiments (ORB day-trading, crypto arb, sports arb) with a low-turnover monthly system.
-
-- Research: `~/reports/Consistent automated trading edge.md`
-- Measured results: [`FINDINGS.md`](FINDINGS.md)
-
-## Reality check
-
-- Beating the S&P **every day or week** is not a realistic design goal (S&P itself is green only ~55–58% of weeks).
-- In locked, costed tests, **gem_qqq_veu** beat SPY CAGR and CPI with milder drawdowns than buy-and-hold QQQ. Classic SPY/VEU GEM beat CPI but lagged SPY CAGR in 2008–2026.
-
-## Setup
+## Research CLI (optional)
 
 ```bash
-cd ~/Documents/Git/profit-engine
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-pip install -r requirements.txt
+profit-engine ml --sweep
+profit-engine paper --ml --cash 1000
 ```
 
-## Commands
-
-```bash
-profit-engine fetch
-profit-engine backtest
-profit-engine backtest --oos-start 2019-01-01
-profit-engine walkforward
-profit-engine iterate --oos-start 2019-01-01
-profit-engine paper
-profit-engine aggressive              # riskier daily/weekly bakeoff with stops
-profit-engine paper --aggressive      # TQQQ mom10 + hard/trailing stops paper book
-profit-engine ml --sweep              # walk-forward ML grid (train on real features)
-profit-engine paper --ml --cash 1000  # promoted ML TQQQ paper book
-```
-
-Outputs land in `output/`. Paper ledger: `data/paper_ledger.sqlite`.
-Aggressive results: [`FINDINGS_AGGRESSIVE.md`](FINDINGS_AGGRESSIVE.md).  
-ML results: [`FINDINGS_ML.md`](FINDINGS_ML.md).
-
-## Frozen gem_qqq_veu rules (paper default)
-
-1. At each **completed** month-end, compute 12-month total returns (adjusted closes).
-2. Relative: hold the stronger of `QQQ` vs `VEU`.
-3. Absolute: if that winner’s 12-month return ≤ 0%, hold `AGG` instead.
-4. Fill at the **next session open**; charge **7.5 bp** round-trip on turnover.
+See `FINDINGS_ML.md` for backtest notes.

@@ -1,12 +1,7 @@
 const $ = (id) => document.getElementById(id);
 let chart;
 const DEFAULT_CASH = 1000;
-const RENDER_API = "https://signal-desk-upb4.onrender.com";
-
-function apiRoot() {
-  if (window.location.hostname.endsWith("github.io")) return RENDER_API;
-  return "";
-}
+const POLL_MS = 30_000;
 
 function fmtMoney(n) {
   if (n == null || Number.isNaN(Number(n))) return "—";
@@ -53,24 +48,6 @@ function tickClock() {
 }
 
 async function loadState() {
-  const root = apiRoot();
-  if (root) {
-    try {
-      const live = await fetch(`${root}/api/state?t=${Date.now()}`, { cache: "no-store" });
-      if (live.ok) {
-        const data = await live.json();
-        const bt = (data.backtest && data.backtest.equity_weekly) || [];
-        const paper = data.paper || {};
-        const decisions = data.decisions || [];
-        if (bt.length || paper.equity != null || paper.signal != null || decisions.length) return data;
-      }
-    } catch (_) {
-      /* cold start / CORS — use static snapshot */
-    }
-    const snap = await fetch(`./state.json?t=${Date.now()}`, { cache: "no-store" });
-    if (!snap.ok) throw new Error(`state failed (${snap.status})`);
-    return snap.json();
-  }
   const res = await fetch(`/api/state?t=${Date.now()}`, { cache: "no-store" });
   if (!res.ok) throw new Error(`state failed (${res.status})`);
   return res.json();
@@ -92,8 +69,7 @@ function renderComparison(paper, strat) {
     $("probaFill").className = "proba-fill";
     $("probaMarker").style.left = "0%";
     $("decisionExplain").textContent =
-      paper.explanation ||
-      "No probability on this bar yet — run sync after the model covers the latest day.";
+      paper.explanation || "Waiting for sync to compute p(up)…";
     $("decisionBarHint").textContent = "p(up) unavailable";
   } else {
     $("mProba").textContent = fmtPct1(p);
@@ -104,11 +80,7 @@ function renderComparison(paper, strat) {
     $("probaFill").style.width = `${Math.max(0, Math.min(100, p * 100))}%`;
     $("probaFill").className = `proba-fill ${pass ? "" : "fail"}`.trim();
     $("probaMarker").style.left = `${Math.max(0, Math.min(100, p * 100))}%`;
-    $("decisionExplain").textContent =
-      paper.explanation ||
-      (pass
-        ? `p(up)=${fmtPct1(p)} cleared the ${fmtPct1(thr)} bar → LONG.`
-        : `p(up)=${fmtPct1(p)} missed the ${fmtPct1(thr)} bar → FLAT.`);
+    $("decisionExplain").textContent = paper.explanation || "";
     $("decisionBarHint").textContent = `bar ${paper.bar_date || "—"} · ${pass ? "PASS" : "FAIL"}`;
   }
 
@@ -120,11 +92,34 @@ function renderComparison(paper, strat) {
     ["Action", actionLabel(paper.action), ""],
   ];
   $("decisionStats").innerHTML = stats
-    .map(
-      ([k, v, cls]) =>
-        `<div><span>${k}</span><strong class="${cls}">${v}</strong></div>`
-    )
+    .map(([k, v, cls]) => `<div><span>${k}</span><strong class="${cls}">${v}</strong></div>`)
     .join("");
+}
+
+function renderStatus(state) {
+  const paper = state.paper || {};
+  const notify = state.notify || {};
+  const open = state.market_open_et;
+  const el = $("liveStatus");
+  if (!el) return;
+
+  const bits = [];
+  bits.push(open === true ? "Market OPEN" : open === false ? "Market CLOSED" : "Market —");
+  bits.push(paper.synced_at ? `synced ${fmtTs(paper.synced_at)}` : "not synced");
+  if (notify.configured === false || (!notify.ok && String(notify.error || "").includes("not configured"))) {
+    bits.push("EMAIL NOT CONFIGURED");
+    el.className = "live-status warn";
+  } else if (notify.ok) {
+    bits.push(`last alert via ${notify.via}`);
+    el.className = "live-status ok";
+  } else if (notify.error && !String(notify.error).startsWith("skipped")) {
+    bits.push(`alert issue: ${notify.error}`);
+    el.className = "live-status warn";
+  } else {
+    bits.push("alerts armed");
+    el.className = "live-status";
+  }
+  el.textContent = bits.join(" · ");
 }
 
 function render(state) {
@@ -171,19 +166,19 @@ function render(state) {
     $("mPosSub").textContent = `${fmtNum(paper.shares ?? pos.shares, 4)} sh · mark ${fmtMoney(paper.mark)}`;
   } else {
     $("mPos").textContent = "CASH";
-    $("mPosSub").textContent = fmtMoney(paper.cash != null ? paper.cash : pos.cash != null ? pos.cash : equity);
+    $("mPosSub").textContent = fmtMoney(
+      paper.cash != null ? paper.cash : pos.cash != null ? pos.cash : equity
+    );
   }
 
   renderComparison(paper, strat);
+  renderStatus(state);
 
   const l3m = promo.l3m_return ?? promo.last3m_1k?.return;
   const l3mProfit = promo.l3m_profit ?? promo.last3m_1k?.profit;
   if (l3m != null) {
     $("m3m").textContent = `${l3m >= 0 ? "+" : ""}${fmtPct(l3m)}`;
     $("m3m").className = `mono ${l3m >= 0 ? "up" : "down"}`;
-  } else if (bt.total_return != null) {
-    $("m3m").textContent = fmtPct(bt.total_return);
-    $("m3m").className = "mono";
   } else {
     $("m3m").textContent = "—";
   }
@@ -199,14 +194,13 @@ function render(state) {
     ["Train window", `${strat.train_days ?? 504} days / fold`],
   ];
   $("strategyCard").innerHTML = card.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
-  $("featureList").innerHTML = (strat.features || [])
-    .map((f) => `<span>${f}</span>`)
-    .join("");
+  $("featureList").innerHTML = (strat.features || []).map((f) => `<span>${f}</span>`).join("");
 
   $("decisionsBody").innerHTML = decisions.length
     ? decisions
         .map((d) => {
-          const pass = d.comparison === "pass" || (d.proba != null && d.proba >= (d.threshold ?? 0.55));
+          const pass =
+            d.comparison === "pass" || (d.proba != null && d.proba >= (d.threshold ?? 0.55));
           const sigCls = d.signal === 1 ? "long" : "flat";
           return `
       <tr>
@@ -223,7 +217,7 @@ function render(state) {
       </tr>`;
         })
         .join("")
-    : `<tr><td colspan="10">No decisions logged yet. Click Run sync (or wait for the next market-hours job) to record p(up) vs threshold.</td></tr>`;
+    : `<tr><td colspan="10">No decisions yet — waiting for next sync.</td></tr>`;
 
   const fills = ((state.ledger && state.ledger.fills) || []).slice().reverse();
   $("fillsBody").innerHTML = fills.length
@@ -240,7 +234,7 @@ function render(state) {
       </tr>`
         )
         .join("")
-    : `<tr><td colspan="6">No paper fills yet — holds do not create trades.</td></tr>`;
+    : `<tr><td colspan="6">No fills yet — holds do not create trades.</td></tr>`;
 
   const metrics = [
     ["Full CAGR", fmtPct(promo.cagr)],
@@ -253,13 +247,18 @@ function render(state) {
   $("promoMetrics").innerHTML = metrics
     .map(([k, v]) => `<div><span>${k}</span><strong>${v}</strong></div>`)
     .join("");
+
   const notify = state.notify || {};
-  const notifyLine = notify.ok
-    ? `alerts ok via ${notify.via} → ${notify.to || ""}`
-    : notify.error
-      ? `alerts NOT delivering: ${notify.error}`
-      : "alerts not tested yet";
-  $("genAt").textContent = `State generated ${state.generated_at || "—"} · mode ${state.mode || "paper"} · ${state.last_sync_reason || "no sync yet"} · ${notifyLine}`;
+  $("genAt").textContent = [
+    `State ${state.generated_at || "—"}`,
+    `mode ${state.mode || "paper"}`,
+    state.last_sync_reason || "no sync",
+    notify.configured === false
+      ? "EMAIL NOT CONFIGURED"
+      : notify.ok
+        ? `last email via ${notify.via}`
+        : notify.error || "alerts ready",
+  ].join(" · ");
 
   const liveEq = ((state.ledger && state.ledger.equity) || [])
     .map((e) => ({ date: String(e.ts || "").slice(0, 10), equity: Number(e.equity) }))
@@ -288,8 +287,6 @@ function drawChart(series) {
   if (!canvas || typeof Chart === "undefined") return;
   if (!series || !series.length) {
     if (chart) chart.destroy();
-    const ctx = canvas.getContext("2d");
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
     return;
   }
   const labels = series.map((p) => p.date);
@@ -336,22 +333,15 @@ async function syncNow() {
   btn.textContent = "Syncing…";
   try {
     const secret = window.localStorage.getItem("CRON_SECRET") || "signal-desk-paper-sync";
-    const root = apiRoot();
-    const res = await fetch(`${root}/api/sync`, {
+    const res = await fetch(`/api/sync`, {
       method: "POST",
       headers: { "X-Cron-Secret": secret },
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      if (root) {
-        try {
-          render(await (await fetch(`./state.json?t=${Date.now()}`, { cache: "no-store" })).json());
-        } catch (_) {}
-      }
-      alert(err.detail || `Sync failed (${res.status}).`);
-    } else {
-      render(await loadState());
+      alert(err.detail || `Sync failed (${res.status})`);
     }
+    render(await loadState());
   } catch (e) {
     alert(String(e));
   } finally {
@@ -360,15 +350,28 @@ async function syncNow() {
   }
 }
 
+async function refresh() {
+  try {
+    const state = await loadState();
+    // enrich with market flag from config if missing
+    if (state.market_open_et == null) {
+      try {
+        const cfg = await (await fetch("/api/config", { cache: "no-store" })).json();
+        state.market_open_et = cfg.market_open_et;
+      } catch (_) {}
+    }
+    render(state);
+  } catch (e) {
+    console.error(e);
+    if ($("mEquitySub")) $("mEquitySub").textContent = String(e);
+  }
+}
+
 async function boot() {
   tickClock();
   setInterval(tickClock, 1000);
   $("syncBtn").addEventListener("click", syncNow);
-  try {
-    render(await loadState());
-  } catch (e) {
-    console.error(e);
-    $("mEquitySub").textContent = String(e);
-  }
+  await refresh();
+  setInterval(refresh, POLL_MS);
 }
 boot();

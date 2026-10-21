@@ -110,7 +110,7 @@ def build_state(*, include_backtest: bool = True) -> dict:
     from .notify import load_notify_status
 
     decisions = load_decisions(limit=60)
-    notify = load_notify_status()
+    notify_status = load_notify_status()
 
     findings = {}
     fm = ROOT / "FINDINGS_ML.md"
@@ -146,7 +146,7 @@ def build_state(*, include_backtest: bool = True) -> dict:
         },
         "paper": paper_last,
         "decisions": decisions,
-        "notify": notify,
+        "notify": notify_status,
         "ledger": ledger,
         "backtest": backtest,
         "promoted_metrics": promoted,

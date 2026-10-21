@@ -27,6 +27,7 @@
   </header>
 
   <main>
+    <p id="liveStatus" class="live-status">Connecting…</p>
     <section class="hero-metrics" id="heroMetrics">
       <article class="metric">
         <span class="label">Paper equity</span>
@@ -143,10 +144,10 @@
         <h2>How to read this desk</h2>
       </div>
       <p class="prose">
-        This is <strong>paper money only</strong>. Each sync recomputes walk-forward HistGradientBoosting
-        probability that TQQQ rises over the next ~5 days. If <strong>p(up) ≥ 55%</strong> the signal is LONG;
-        otherwise FLAT. The paper book then buys, sells, hits a stop, or holds. The decision log keeps every
-        comparison so you can see the percentage and what happened. Syncs run weekdays around open, hourly in RTH, after close, or via Run sync.
+        This is <strong>paper money only</strong> on one host: the Render backend trades, serves this UI, and
+        emails you on fills. Each sync recomputes walk-forward HistGradientBoosting p(up) for TQQQ.
+        If <strong>p(up) ≥ 55%</strong> → LONG, else FLAT; then the paper book buys, sells, stops, or holds.
+        This page refreshes live every 30s. Syncs run weekdays around open, hourly in RTH, after close, or via Run sync.
       </p>
     </section>
   </main>

@@ -1,4 +1,4 @@
-"""Trade alert emails (paper fills)."""
+"""Trade email alerts from the backend (paper fills only)."""
 
 from __future__ import annotations
 
@@ -26,6 +26,16 @@ def _to_addr() -> str:
     return (os.environ.get("TRADE_ALERT_EMAIL") or DEFAULT_TO).strip()
 
 
+def email_configured() -> bool:
+    if os.environ.get("RESEND_API_KEY", "").strip():
+        return True
+    return bool(
+        os.environ.get("SMTP_HOST", "").strip()
+        and os.environ.get("SMTP_USER", "").strip()
+        and os.environ.get("SMTP_PASS", "").strip()
+    )
+
+
 def _subject(info: dict[str, Any]) -> str:
     action = str(info.get("action") or "trade")
     side = {
@@ -40,19 +50,21 @@ def _body(info: dict[str, Any]) -> str:
     lines = [
         "Paper trade executed on Signal Desk.",
         "",
-        f"Action:  {info.get('action')}",
-        f"Signal:  {info.get('signal')}",
-        f"Proba:   {info.get('proba')}",
-        f"Equity:  {info.get('equity')}",
-        f"Cash:    {info.get('cash')}",
-        f"Shares:  {info.get('shares')}",
-        f"Mark:    {info.get('mark')}",
-        f"Synced:  {info.get('synced_at')}",
-        f"Run:     {info.get('run_id')}",
+        f"Action:      {info.get('action')}",
+        f"Signal:      {info.get('signal')}",
+        f"p(up):       {info.get('proba')}",
+        f"Threshold:   {info.get('threshold')}",
+        f"Equity:      {info.get('equity')}",
+        f"Cash:        {info.get('cash')}",
+        f"Shares:      {info.get('shares')}",
+        f"Mark:        {info.get('mark')}",
+        f"Bar:         {info.get('bar_date')}",
+        f"Synced:      {info.get('synced_at')}",
+        f"Explanation: {info.get('explanation')}",
         "",
-        "Live desk: https://signal-desk-upb4.onrender.com",
+        "Desk: https://signal-desk-upb4.onrender.com",
     ]
-    return "\n".join(lines)
+    return "\n".join(str(x) for x in lines)
 
 
 def _save_status(payload: dict[str, Any]) -> None:
@@ -63,11 +75,13 @@ def _save_status(payload: dict[str, Any]) -> None:
 
 def load_notify_status() -> dict[str, Any]:
     if not STATUS_PATH.exists():
-        return {}
+        return {"ok": False, "configured": email_configured()}
     try:
-        return json.loads(STATUS_PATH.read_text())
+        data = json.loads(STATUS_PATH.read_text())
+        data["configured"] = email_configured()
+        return data
     except Exception:  # noqa: BLE001
-        return {}
+        return {"ok": False, "configured": email_configured()}
 
 
 def _send_resend(to: str, subject: str, body: str) -> str | None:
@@ -106,28 +120,15 @@ def _send_smtp(to: str, subject: str, body: str) -> str | None:
     return "smtp"
 
 
-def _send_ntfy(to: str, subject: str, body: str) -> str | None:
-    """Push + optional email via ntfy (email needs NTFY_EMAIL=1 on ntfy.sh paid, push is free)."""
-    topic = os.environ.get("NTFY_TOPIC", "signal-desk-tarun").strip()
-    if not topic or topic.lower() in {"0", "off", "false", "none"}:
-        return None
-    headers = {
-        "Title": subject[:120],
-        "Priority": "high",
-        "Tags": "chart_with_upwards_trend,moneybag",
-    }
-    # ntfy.sh email delivery when enabled
-    if os.environ.get("NTFY_EMAIL", "0") == "1":
-        headers["Email"] = to
-    r = requests.post(f"https://ntfy.sh/{topic}", headers=headers, data=body.encode("utf-8"), timeout=15)
-    if not r.ok:
-        raise RuntimeError(f"ntfy HTTP {r.status_code}: {r.text[:200]}")
-    return "ntfy"
-
-
 def send_trade_alert(info: dict[str, Any]) -> dict[str, Any]:
-    """Email/push on real paper fills. Never raises into the trading loop."""
-    result: dict[str, Any] = {"ok": False, "via": None, "to": _to_addr(), "action": info.get("action")}
+    """Email on real paper fills. Never raises into the trading loop."""
+    result: dict[str, Any] = {
+        "ok": False,
+        "via": None,
+        "to": _to_addr(),
+        "action": info.get("action"),
+        "configured": email_configured(),
+    }
     if not _enabled():
         result["error"] = "TRADE_ALERTS disabled"
         _save_status(result)
@@ -142,11 +143,19 @@ def send_trade_alert(info: dict[str, Any]) -> dict[str, Any]:
         result["error"] = "missing TRADE_ALERT_EMAIL"
         _save_status(result)
         return result
+    if not email_configured():
+        result["error"] = (
+            "Email not configured. Set RESEND_API_KEY or SMTP_PASS (Gmail app password) on Render."
+        )
+        print(f"[notify] FAILED: {result['error']}", flush=True)
+        _save_status(result)
+        return result
+
     subject = _subject(info)
     body = _body(info)
     errors: list[str] = []
     try:
-        for sender in (_send_resend, _send_smtp, _send_ntfy):
+        for sender in (_send_resend, _send_smtp):
             try:
                 via = sender(to, subject, body)
             except Exception as exc:  # noqa: BLE001
@@ -154,14 +163,10 @@ def send_trade_alert(info: dict[str, Any]) -> dict[str, Any]:
                 continue
             if via:
                 result.update({"ok": True, "via": via, "error": None})
-                print(f"[notify] sent via {via} → {to} ({action})", flush=True)
+                print(f"[notify] emailed via {via} → {to} ({action})", flush=True)
                 _save_status(result)
                 return result
-        result["error"] = (
-            "No working email transport. Set RESEND_API_KEY or SMTP_HOST/SMTP_USER/SMTP_PASS "
-            "(Gmail app password) on Render. "
-            + ("; ".join(errors) if errors else "FormSubmit removed — it was timing out.")
-        )
+        result["error"] = "; ".join(errors) if errors else "no transport succeeded"
         print(f"[notify] FAILED: {result['error']}", flush=True)
     except Exception as exc:  # noqa: BLE001
         result["error"] = str(exc)

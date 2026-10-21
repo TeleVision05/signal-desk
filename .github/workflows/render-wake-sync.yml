@@ -42,7 +42,7 @@ jobs:
           cat /tmp/sync.json || true
           echo
           if [ "$code" != "200" ]; then
-            echo "Render sync not ready yet (likely old deploy / secret). Pages Action still publishes the desk."
-            exit 0
+            echo "Render sync failed HTTP $code"
+            exit 1
           fi
-          curl -fsS --max-time 30 "$RENDER_URL/api/state" | python -c "import sys,json; d=json.load(sys.stdin); p=d.get('paper') or {}; print('signal', p.get('signal'), 'equity', p.get('equity'), 'action', p.get('action'), 'bt', len((d.get('backtest') or {}).get('equity_weekly') or []))"
+          curl -fsS --max-time 30 "$RENDER_URL/api/state" | python -c "import sys,json; d=json.load(sys.stdin); p=d.get('paper') or {}; n=d.get('notify') or {}; print('signal', p.get('signal'), 'p', p.get('proba'), 'action', p.get('action'), 'equity', p.get('equity'), 'email_ok', n.get('ok'), 'email_cfg', n.get('configured'))"
