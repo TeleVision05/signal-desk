@@ -1,0 +1,87 @@
+name: Deploy Signal Desk to GitHub Pages
+
+on:
+  schedule:
+    - cron: "30 21 * * 1-5"
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install + paper sync
+        env:
+          PAPER_CASH: "1000"
+        run: |
+          pip install -r requirements.txt
+          pip install -e .
+          python - <<'PY'
+          import json, shutil, traceback
+          from pathlib import Path
+          from profit_engine.dashboard_state import build_state, SEED_PATH
+
+          info = {}
+          try:
+              from profit_engine.paper_ml import sync_ml_paper
+              info = sync_ml_paper(initial_cash=1000.0)
+              print("sync ok", {k: info.get(k) for k in ("equity","signal","action")})
+          except Exception as e:
+              print("sync skipped:", e)
+              traceback.print_exc()
+
+          state = build_state(include_backtest=True)
+          if info:
+              state["paper"] = info
+          Path("data").mkdir(exist_ok=True)
+          Path("data/dashboard_state.json").write_text(json.dumps(state, indent=2, default=str))
+
+          site = Path("site")
+          if site.exists():
+              shutil.rmtree(site)
+          site.mkdir()
+          shutil.copytree("dashboard/static", site / "static")
+          # Pages-friendly index that fetches ./state.json
+          html = (Path("dashboard/static/index.html")).read_text()
+          html = html.replace('href="/static/', 'href="./static/')
+          html = html.replace('src="/static/', 'src="./static/')
+          html = html.replace('href="/api/state"', 'href="./state.json"')
+          (site / "index.html").write_text(html)
+          js = (site / "static" / "app.js").read_text()
+          js = js.replace('fetch("/api/state")', 'fetch("./state.json")')
+          # Disable live sync button effect on static hosting — call state refresh only
+          js = js.replace(
+              'const res = await fetch("/api/sync", {\n      method: "POST",\n      headers: { "X-Cron-Secret": secret },\n    });',
+              'const res = { ok: false, status: 501, json: async () => ({ detail: "Live sync runs on the weekday GitHub Action / Render host. This Pages site refreshes after each scheduled run." }) };'
+          )
+          (site / "static" / "app.js").write_text(js)
+          (site / "state.json").write_text(json.dumps(state, indent=2, default=str))
+          print("site ready")
+          PY
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
