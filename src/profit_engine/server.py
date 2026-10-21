@@ -2,72 +2,121 @@
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .dashboard_state import STATE_PATH, build_state, load_state
+from .dashboard_state import STATE_PATH, build_state, ensure_dashboard_state, load_state
 
 ROOT = Path(__file__).resolve().parents[2]
 STATIC = ROOT / "dashboard" / "static"
 CRON_SECRET = os.environ.get("CRON_SECRET", "dev-paper-secret")
 INITIAL_CASH = float(os.environ.get("PAPER_CASH", "1000"))
+ET = ZoneInfo("America/New_York")
 
 _sync_lock = threading.Lock()
 _scheduler: BackgroundScheduler | None = None
 
 
-def _run_paper_sync() -> dict:
+def _us_equity_session_open(now: datetime | None = None) -> bool:
+    """Rough US cash session: weekdays 9:30–16:00 America/New_York (no holiday calendar)."""
+    now = now or datetime.now(ET)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ET)
+    else:
+        now = now.astimezone(ET)
+    if now.weekday() >= 5:
+        return False
+    minutes = now.hour * 60 + now.minute
+    return (9 * 60 + 30) <= minutes <= (16 * 60)
+
+
+def _run_paper_sync(*, reason: str = "manual") -> dict:
     with _sync_lock:
         from .paper_ml import sync_ml_paper
 
+        print(f"[sync] start reason={reason}", flush=True)
         info = sync_ml_paper(initial_cash=INITIAL_CASH)
+        # Persist paper snapshot for next boot
+        OUT = ROOT / "output"
+        OUT.mkdir(parents=True, exist_ok=True)
+        (OUT / "ml_paper_last.json").write_text(json.dumps(info, indent=2, default=str))
+
         state = build_state(include_backtest=True)
         state["paper"] = info
         state["last_sync_at"] = datetime.now(timezone.utc).isoformat()
-        STATE_PATH.write_text(__import__("json").dumps(state, indent=2, default=str))
+        state["last_sync_reason"] = reason
+        STATE_PATH.write_text(json.dumps(state, indent=2, default=str))
+        print(
+            f"[sync] done signal={info.get('signal')} equity={info.get('equity')} action={info.get('action')}",
+            flush=True,
+        )
         return info
 
 
-def _scheduled_sync():
+def _scheduled_sync(reason: str = "schedule"):
     try:
-        _run_paper_sync()
+        _run_paper_sync(reason=reason)
     except Exception as exc:  # noqa: BLE001
-        print(f"[scheduler] sync failed: {exc}", flush=True)
+        print(f"[scheduler] sync failed ({reason}): {exc}", flush=True)
+
+
+def _maybe_intraday_sync():
+    """During RTH, refresh marks/signals; outside RTH only log skip unless forced jobs run."""
+    if _us_equity_session_open():
+        _scheduled_sync("rth_hourly")
+    else:
+        print("[scheduler] skip rth_hourly — market closed", flush=True)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _scheduler
-    # Ensure state exists for first paint
-    if not STATE_PATH.exists():
-        try:
-            build_state(include_backtest=True)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[startup] state build deferred: {exc}", flush=True)
+    try:
+        ensure_dashboard_state()
+        print("[startup] dashboard state ready", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[startup] state ensure failed: {exc}", flush=True)
 
     _scheduler = BackgroundScheduler(timezone="UTC")
-    # Weekdays 21:15 UTC ≈ after US cash close
-    _scheduler.add_job(_scheduled_sync, "cron", day_of_week="mon-fri", hour=21, minute=15, id="paper_sync")
+    # Pre-open wake / sync (13:35 UTC ≈ 9:35 ET EDT)
+    _scheduler.add_job(_scheduled_sync, "cron", day_of_week="mon-fri", hour=13, minute=35, args=["preopen"], id="preopen")
+    # Hourly during typical RTH window UTC (14:00–20:00) — job self-gates on ET session
+    _scheduler.add_job(_maybe_intraday_sync, "cron", day_of_week="mon-fri", hour="14-20", minute=5, id="rth_hourly")
+    # After US cash close (21:15 UTC)
+    _scheduler.add_job(_scheduled_sync, "cron", day_of_week="mon-fri", hour=21, minute=15, args=["after_close"], id="after_close")
     _scheduler.start()
+
+    # Kick an initial sync in background so paper isn't empty forever
+    threading.Thread(target=lambda: _scheduled_sync("startup"), daemon=True).start()
+
     yield
     if _scheduler:
         _scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Signal Desk", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Signal Desk", version="0.2.0", lifespan=lifespan)
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "mode": "paper_only", "utc": datetime.now(timezone.utc).isoformat()}
+    return {
+        "ok": True,
+        "mode": "paper_only",
+        "utc": datetime.now(timezone.utc).isoformat(),
+        "et": datetime.now(ET).isoformat(),
+        "market_open_et": _us_equity_session_open(),
+        "version": "0.2.0",
+    }
 
 
 @app.get("/api/state")
@@ -79,16 +128,16 @@ def state():
 def sync(x_cron_secret: str | None = Header(default=None)):
     if x_cron_secret != CRON_SECRET:
         raise HTTPException(status_code=401, detail="invalid cron secret")
-    info = _run_paper_sync()
+    info = _run_paper_sync(reason="api")
     return {"ok": True, "paper": info}
 
 
 @app.get("/")
 def index():
-    index = STATIC / "index.html"
-    if not index.exists():
+    index_path = STATIC / "index.html"
+    if not index_path.exists():
         raise HTTPException(404, "dashboard not built")
-    return FileResponse(index)
+    return FileResponse(index_path)
 
 
 if STATIC.exists():

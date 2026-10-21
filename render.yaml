@@ -7,7 +7,8 @@ services:
     envVars:
       - key: PAPER_CASH
         value: "1000"
+      # Shared with GitHub Action wake/sync (paper-only; rotate anytime in Render env)
       - key: CRON_SECRET
-        generateValue: true
+        value: signal-desk-paper-sync
       - key: PYTHONUNBUFFERED
         value: "1"

@@ -1,0 +1,42 @@
+name: Wake Render + paper sync
+
+# Keeps the free Render dyno awake around US cash hours and triggers /api/sync
+on:
+  schedule:
+    # ~9:35 ET (13:35 UTC) pre-open / open
+    - cron: "35 13 * * 1-5"
+    # Hourly during RTH-ish UTC window
+    - cron: "10 14,15,16,17,18,19,20 * * 1-5"
+    # After close ~21:20 UTC
+    - cron: "20 21 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake + sync Render Signal Desk
+        env:
+          RENDER_URL: ${{ vars.RENDER_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          set -euo pipefail
+          RENDER_URL="${RENDER_URL:-https://signal-desk-upb4.onrender.com}"
+          CRON_SECRET="${CRON_SECRET:-signal-desk-paper-sync}"
+          echo "Waking $RENDER_URL ..."
+          # Cold start can take >50s on free tier
+          for i in 1 2 3 4 5 6 7 8; do
+            if curl -fsS --max-time 30 "$RENDER_URL/api/health"; then
+              echo
+              break
+            fi
+            echo "attempt $i failed, sleeping..."
+            sleep 15
+          done
+          curl -fsS --max-time 30 "$RENDER_URL/api/health"; echo
+          echo "POST /api/sync"
+          curl -fsS --max-time 600 -X POST "$RENDER_URL/api/sync" \
+            -H "X-Cron-Secret: $CRON_SECRET" \
+            -H "Content-Type: application/json"
+          echo
+          curl -fsS --max-time 30 "$RENDER_URL/api/state" | python -c "import sys,json; d=json.load(sys.stdin); p=d.get('paper') or {}; print('signal', p.get('signal'), 'equity', p.get('equity'), 'action', p.get('action'), 'bt', len((d.get('backtest') or {}).get('equity_weekly') or []))"
