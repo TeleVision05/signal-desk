@@ -108,8 +108,8 @@ def _send_smtp(to: str, subject: str, body: str) -> str | None:
 
 def _send_ntfy(to: str, subject: str, body: str) -> str | None:
     """Push + optional email via ntfy (email needs NTFY_EMAIL=1 on ntfy.sh paid, push is free)."""
-    topic = os.environ.get("NTFY_TOPIC", "").strip()
-    if not topic:
+    topic = os.environ.get("NTFY_TOPIC", "signal-desk-tarun").strip()
+    if not topic or topic.lower() in {"0", "off", "false", "none"}:
         return None
     headers = {
         "Title": subject[:120],
