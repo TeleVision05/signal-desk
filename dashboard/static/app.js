@@ -19,7 +19,10 @@ function tickClock() {
 }
 
 async function loadState() {
-  const res = await fetch("/api/state");
+  const url = window.location.hostname.endsWith("github.io")
+    ? `./state.json?t=${Date.now()}`
+    : "/api/state";
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error("state failed");
   return res.json();
 }
