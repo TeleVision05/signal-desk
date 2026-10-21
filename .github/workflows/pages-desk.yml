@@ -47,6 +47,12 @@ jobs:
           state = build_state(include_backtest=True)
           if info:
               state["paper"] = info
+          # Preserve seed equity curve if CI has no local backtest CSV
+          if not state.get("backtest") or not state["backtest"].get("equity_weekly"):
+              seed = json.loads(Path("dashboard/seed_state.json").read_text())
+              state["backtest"] = seed.get("backtest") or {}
+              if not state.get("promoted_metrics"):
+                  state["promoted_metrics"] = seed.get("promoted_metrics") or {}
           Path("data").mkdir(exist_ok=True)
           Path("data/dashboard_state.json").write_text(json.dumps(state, indent=2, default=str))
 
