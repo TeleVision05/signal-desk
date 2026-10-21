@@ -107,7 +107,7 @@ async def lifespan(app: FastAPI):
         _scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Signal Desk", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Signal Desk", version="0.2.1", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -130,8 +130,9 @@ def health():
         "utc": datetime.now(timezone.utc).isoformat(),
         "et": datetime.now(ET).isoformat(),
         "market_open_et": _us_equity_session_open(),
-        "version": "0.2.0",
+        "version": "0.2.1",
         "allow_public_sync": ALLOW_PUBLIC_SYNC,
+        "trade_alerts": os.environ.get("TRADE_ALERTS", "1") == "1",
     }
 
 
@@ -156,7 +157,33 @@ def config():
         "allow_public_sync": ALLOW_PUBLIC_SYNC,
         "market_open_et": _us_equity_session_open(),
         "schedules": ["preopen 13:35 UTC", "rth hourly 14-20 UTC", "after_close 21:15 UTC"],
+        "trade_alert_email": os.environ.get("TRADE_ALERT_EMAIL", "tarun.vadapalli.1@gmail.com"),
     }
+
+
+@app.post("/api/test-alert")
+def test_alert(x_cron_secret: str | None = Header(default=None)):
+    """Send a sample trade email so FormSubmit/SMTP can be activated."""
+    authed = x_cron_secret == CRON_SECRET or ALLOW_PUBLIC_SYNC
+    if not authed:
+        raise HTTPException(status_code=401, detail="invalid cron secret")
+    from .notify import send_trade_alert
+
+    sample = {
+        "run_id": "ml-tqqq-hgb-paper-v1",
+        "strategy": "ml_TQQQ_hgb_h5_t0.55",
+        "signal": 1,
+        "proba": 0.61,
+        "action": "signal_entry",
+        "equity": 1000.0,
+        "cash": 0.0,
+        "asset": "TQQQ",
+        "shares": 14.2,
+        "mark": 70.4,
+        "synced_at": datetime.now(timezone.utc).isoformat(),
+    }
+    send_trade_alert(sample)
+    return {"ok": True, "emailed": sample}
 
 
 @app.get("/")

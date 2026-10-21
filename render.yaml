@@ -12,5 +12,9 @@ services:
         value: signal-desk-paper-sync
       - key: ALLOW_PUBLIC_SYNC
         value: "1"
+      - key: TRADE_ALERTS
+        value: "1"
+      - key: TRADE_ALERT_EMAIL
+        value: tarun.vadapalli.1@gmail.com
       - key: PYTHONUNBUFFERED
         value: "1"

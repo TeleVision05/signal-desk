@@ -127,4 +127,10 @@ def sync_ml_paper(
         "synced_at": datetime.now(timezone.utc).isoformat(),
     }
     (OUT / "ml_paper_last.json").write_text(json.dumps(info, indent=2))
+    try:
+        from .notify import send_trade_alert
+
+        send_trade_alert(info)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[notify] hook failed: {exc}", flush=True)
     return info
