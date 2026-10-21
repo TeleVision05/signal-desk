@@ -19,18 +19,20 @@ function fmtPct1(n) {
   if (n == null || Number.isNaN(Number(n))) return "—";
   return `${(Number(n) * 100).toFixed(1)}%`;
 }
-function fmtPts(n) {
-  if (n == null || Number.isNaN(Number(n))) return "—";
-  const v = Number(n) * 100;
-  return `${v >= 0 ? "+" : ""}${v.toFixed(1)} pts`;
-}
 function fmtNum(n, d = 2) {
   if (n == null || Number.isNaN(Number(n))) return "—";
   return Number(n).toFixed(d);
 }
-function fmtTs(s) {
+function fmtWhen(s) {
   if (!s) return "—";
-  return String(s).replace("T", " ").slice(0, 16) + "Z";
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) return String(s).replace("T", " ").slice(0, 16);
+  return d.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 function actionLabel(a) {
   return (
@@ -42,137 +44,218 @@ function actionLabel(a) {
     }[a] || String(a || "—").toUpperCase()
   );
 }
+function whyTrade(source, side) {
+  const s = String(source || "").toLowerCase();
+  if (s.includes("stop")) return "Stop loss — cut losses";
+  if (s.includes("signal") && String(side).toUpperCase() === "BUY") return "Bot was confident enough to buy";
+  if (s.includes("signal")) return "Bot confidence dropped — sold";
+  if (String(side).toUpperCase() === "BUY") return "Bought";
+  if (String(side).toUpperCase() === "SELL") return "Sold";
+  return source || "—";
+}
+function confBucket(p, thr) {
+  if (p == null) return { label: "Waiting", key: "wait" };
+  if (p >= thr) return { label: "High", key: "high" };
+  if (p >= thr - 0.1) return { label: "Maybe", key: "maybe" };
+  return { label: "Low", key: "low" };
+}
+function updateLogLine(d) {
+  const action = d.action || "hold";
+  if (action === "signal_entry") return "Bought TQQQ — confidence was high enough.";
+  if (action === "signal_exit") return "Sold TQQQ — confidence dropped.";
+  if (action === "stop_exit") return "Sold TQQQ — stop loss triggered.";
+  if (d.signal === 1) return "Checked market — still invested (no new trade).";
+  return "Checked market — still in cash (no new trade).";
+}
+
+function setView(name) {
+  const simple = name === "simple";
+  $("view-simple").classList.toggle("active", simple);
+  $("view-simple").hidden = !simple;
+  $("view-advanced").classList.toggle("active", !simple);
+  $("view-advanced").hidden = simple;
+  document.querySelectorAll(".nav-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.view === name);
+  });
+  try {
+    localStorage.setItem("sd_view", name);
+  } catch (_) {}
+}
+
+function bindNav() {
+  document.querySelectorAll(".nav-btn").forEach((btn) => {
+    btn.addEventListener("click", () => setView(btn.dataset.view));
+  });
+  let start = "simple";
+  try {
+    start = localStorage.getItem("sd_view") || "simple";
+  } catch (_) {}
+  setView(start === "advanced" ? "advanced" : "simple");
+}
+
+function bindTooltip() {
+  const btn = $("tqqqTip");
+  const pop = $("tipPop");
+  if (!btn || !pop) return;
+  const place = () => {
+    const r = btn.getBoundingClientRect();
+    pop.style.left = `${Math.min(window.innerWidth - 300, Math.max(8, r.left))}px`;
+    pop.style.top = `${r.bottom + 8}px`;
+  };
+  const show = () => {
+    place();
+    pop.hidden = false;
+  };
+  const hide = () => {
+    pop.hidden = true;
+  };
+  btn.addEventListener("mouseenter", show);
+  btn.addEventListener("mouseleave", hide);
+  btn.addEventListener("focus", show);
+  btn.addEventListener("blur", hide);
+  btn.addEventListener("click", (e) => {
+    e.preventDefault();
+    if (pop.hidden) show();
+    else hide();
+  });
+}
 
 function tickClock() {
-  $("clock").textContent = new Date().toISOString().replace("T", " ").slice(0, 19) + " UTC";
+  const el = $("clock");
+  if (el) el.textContent = new Date().toLocaleString();
 }
 
 async function loadState() {
   const res = await fetch(`/api/state?t=${Date.now()}`, { cache: "no-store" });
-  if (!res.ok) throw new Error(`state failed (${res.status})`);
+  if (!res.ok) throw new Error(`Could not load desk (${res.status})`);
   return res.json();
 }
 
-function renderComparison(paper, strat) {
-  const thr = Number(paper.threshold ?? strat.proba_threshold ?? 0.55);
-  const p = paper.proba != null ? Number(paper.proba) : null;
-  const pass = p != null && p >= thr;
-
-  $("thrLabel").textContent = `threshold ${(thr * 100).toFixed(0)}%`;
-  $("probaThreshold").style.left = `${thr * 100}%`;
-
-  if (p == null) {
-    $("mProba").textContent = "—";
-    $("mProba").className = "mono";
-    $("mProbaSub").textContent = `need ≥ ${fmtPct1(thr)} to go long`;
-    $("probaFill").style.width = "0%";
-    $("probaFill").className = "proba-fill";
-    $("probaMarker").style.left = "0%";
-    $("decisionExplain").textContent =
-      paper.explanation || "Waiting for sync to compute p(up)…";
-    $("decisionBarHint").textContent = "p(up) unavailable";
-  } else {
-    $("mProba").textContent = fmtPct1(p);
-    $("mProba").className = `mono ${pass ? "up" : "down"}`;
-    $("mProbaSub").textContent = pass
-      ? `${fmtPts(p - thr)} over ${fmtPct1(thr)} threshold`
-      : `${fmtPts(p - thr)} under ${fmtPct1(thr)} threshold`;
-    $("probaFill").style.width = `${Math.max(0, Math.min(100, p * 100))}%`;
-    $("probaFill").className = `proba-fill ${pass ? "" : "fail"}`.trim();
-    $("probaMarker").style.left = `${Math.max(0, Math.min(100, p * 100))}%`;
-    $("decisionExplain").textContent = paper.explanation || "";
-    $("decisionBarHint").textContent = `bar ${paper.bar_date || "—"} · ${pass ? "PASS" : "FAIL"}`;
-  }
-
-  const stats = [
-    ["p(up)", p == null ? "—" : fmtPct1(p), pass ? "pass" : p == null ? "" : "fail"],
-    ["Threshold", fmtPct1(thr), ""],
-    ["Gap", p == null ? "—" : fmtPts(p - thr), pass ? "pass" : p == null ? "" : "fail"],
-    ["Signal", paper.signal === 1 ? "LONG" : paper.signal === 0 ? "FLAT" : "—", ""],
-    ["Action", actionLabel(paper.action), ""],
-  ];
-  $("decisionStats").innerHTML = stats
-    .map(([k, v, cls]) => `<div><span>${k}</span><strong class="${cls}">${v}</strong></div>`)
-    .join("");
-}
-
-function renderStatus(state) {
-  const paper = state.paper || {};
-  const notify = state.notify || {};
-  const open = state.market_open_et;
-  const el = $("liveStatus");
-  if (!el) return;
-
-  const bits = [];
-  bits.push(open === true ? "Market OPEN" : open === false ? "Market CLOSED" : "Market —");
-  bits.push(paper.synced_at ? `synced ${fmtTs(paper.synced_at)}` : "not synced");
-  if (notify.configured === false || (!notify.ok && String(notify.error || "").includes("not configured"))) {
-    bits.push("EMAIL NOT CONFIGURED");
-    el.className = "live-status warn";
-  } else if (notify.ok) {
-    bits.push(`last alert via ${notify.via}`);
-    el.className = "live-status ok";
-  } else if (notify.error && !String(notify.error).startsWith("skipped")) {
-    bits.push(`alert issue: ${notify.error}`);
-    el.className = "live-status warn";
-  } else {
-    bits.push("alerts armed");
-    el.className = "live-status";
-  }
-  el.textContent = bits.join(" · ");
-}
-
-function render(state) {
+function renderSimple(state) {
   const paper = state.paper || {};
   const pos = (state.ledger && state.ledger.position) || {};
   const strat = state.strategy || {};
-  const promo = state.promoted_metrics || {};
-  const bt = state.backtest || {};
+  const notify = state.notify || {};
   const decisions = state.decisions || [];
+  const thr = Number(paper.threshold ?? strat.proba_threshold ?? 0.55);
+  const p = paper.proba != null ? Number(paper.proba) : null;
+  const shares = Number(paper.shares ?? pos.shares ?? 0);
+  const invested = shares > 0 || paper.signal === 1;
 
   let equity = null;
   if (paper.equity != null) equity = Number(paper.equity);
-  else if (pos.cash != null || pos.shares) {
-    equity = Number(pos.cash || 0) + Number(pos.shares || 0) * Number(paper.mark || 0);
+  else if (pos.cash != null || shares) {
+    equity = Number(pos.cash || 0) + shares * Number(paper.mark || 0);
   } else {
     equity = DEFAULT_CASH;
   }
 
-  $("mEquity").textContent = fmtMoney(equity);
-  $("mEquity").className = "mono";
-  $("mEquitySub").textContent = paper.synced_at
-    ? `synced ${fmtTs(paper.synced_at)}`
-    : state.last_sync_at
-      ? `last sync ${fmtTs(state.last_sync_at)}`
-      : "waiting for first paper sync";
+  $("marketLine").textContent =
+    state.market_open_et === true
+      ? "US market is open"
+      : state.market_open_et === false
+        ? "US market is closed"
+        : "Market status unknown";
 
-  const sig = paper.signal;
-  if (sig === 1) {
-    $("mSignal").textContent = "LONG";
-    $("mSignal").className = "mono up";
-  } else if (sig === 0) {
-    $("mSignal").textContent = "FLAT";
-    $("mSignal").className = "mono flat";
-  } else {
-    $("mSignal").textContent = "—";
-    $("mSignal").className = "mono";
-  }
-  $("mSignalSub").textContent = paper.action
-    ? `last action: ${actionLabel(paper.action)}`
-    : "awaiting sync";
+  $("heroStatus").textContent = invested ? "We're currently invested" : "We're sitting in cash";
+  $("heroAsset").textContent = paper.asset || pos.asset || "TQQQ";
+  $("heroEquity").textContent = fmtMoney(equity);
 
-  if (pos.asset || (paper.shares && Number(paper.shares) > 0)) {
-    $("mPos").textContent = paper.asset || pos.asset || "TQQQ";
-    $("mPosSub").textContent = `${fmtNum(paper.shares ?? pos.shares, 4)} sh · mark ${fmtMoney(paper.mark)}`;
+  $("lastUpdate").textContent = fmtWhen(paper.synced_at || state.last_sync_at);
+  $("nextUpdate").textContent = fmtWhen(state.next_sync_at);
+
+  const emailEl = $("emailLine");
+  if (notify.configured === false) {
+    emailEl.textContent = "Trade emails: not set up";
+    emailEl.className = "email-line warn";
+  } else if (notify.ok) {
+    emailEl.textContent = "Trade emails: working";
+    emailEl.className = "email-line ok";
+  } else if (notify.error && !String(notify.error).startsWith("skipped")) {
+    emailEl.textContent = `Trade emails: issue (${notify.error})`;
+    emailEl.className = "email-line warn";
   } else {
-    $("mPos").textContent = "CASH";
-    $("mPosSub").textContent = fmtMoney(
-      paper.cash != null ? paper.cash : pos.cash != null ? pos.cash : equity
-    );
+    emailEl.textContent = "Trade emails: working";
+    emailEl.className = "email-line ok";
   }
 
-  renderComparison(paper, strat);
-  renderStatus(state);
+  const bucket = confBucket(p, thr);
+  $("confLevel").textContent = bucket.label;
+  $("confThreshold").style.left = `${thr * 100}%`;
+  if (p == null) {
+    $("confSentence").textContent = "Waiting for the next update to score confidence…";
+    $("confFill").style.width = "0%";
+    $("confMarker").style.left = "0%";
+    $("confAction").textContent = "";
+  } else {
+    const pct = (p * 100).toFixed(1);
+    const thrPct = (thr * 100).toFixed(0);
+    $("confSentence").textContent = `Bot is ${pct}% sure prices go up; it buys above ${thrPct}%.`;
+    const left = Math.max(0, Math.min(100, p * 100));
+    $("confFill").style.width = `${left}%`;
+    $("confMarker").style.left = `${left}%`;
+    if (paper.action === "signal_entry") {
+      $("confAction").textContent = "Last move: bought because confidence cleared the bar.";
+    } else if (paper.action === "signal_exit") {
+      $("confAction").textContent = "Last move: sold because confidence dropped.";
+    } else if (paper.action === "stop_exit") {
+      $("confAction").textContent = "Last move: sold on a stop loss to limit damage.";
+    } else if (invested) {
+      $("confAction").textContent = "Holding the position — no new trade this update.";
+    } else {
+      $("confAction").textContent = "Staying in cash until confidence is High.";
+    }
+  }
+
+  const fills = ((state.ledger && state.ledger.fills) || []).slice().reverse();
+  $("tradesBody").innerHTML = fills.length
+    ? fills
+        .map((f) => {
+          const side = String(f.side || "").toUpperCase();
+          const cls = side === "BUY" ? "buy" : side === "SELL" ? "sell" : "";
+          const label = side === "BUY" ? "Bought" : side === "SELL" ? "Sold" : side || "—";
+          return `<tr>
+            <td>${fmtWhen(f.ts)}</td>
+            <td class="${cls}">${label}</td>
+            <td class="wrap">${whyTrade(f.source, side)}</td>
+            <td>${fmtMoney(f.cost)}</td>
+          </tr>`;
+        })
+        .join("")
+    : `<tr><td colspan="4">No trades yet — the bot is waiting for a High confidence signal.</td></tr>`;
+
+  const log = decisions.slice(0, 10);
+  $("updateLog").innerHTML = log.length
+    ? log
+        .map(
+          (d) => `<li>
+            <time datetime="${d.synced_at || ""}">${fmtWhen(d.synced_at)}</time>
+            <span>${updateLogLine(d)}</span>
+          </li>`
+        )
+        .join("")
+    : `<li><span class="muted">No updates yet — waiting for the first scheduled check.</span></li>`;
+
+  const liveEq = ((state.ledger && state.ledger.equity) || [])
+    .map((e) => ({ date: String(e.ts || "").slice(0, 10), equity: Number(e.equity) }))
+    .filter((e) => e.date && !Number.isNaN(e.equity));
+  $("chartHint").textContent = liveEq.length
+    ? "Fake money over time (practice account)"
+    : "No paper marks yet — chart fills in after updates";
+  try {
+    drawChart(liveEq);
+  } catch (err) {
+    console.error("chart", err);
+    $("chartHint").textContent = "Chart unavailable";
+  }
+}
+
+function renderAdvanced(state) {
+  const paper = state.paper || {};
+  const strat = state.strategy || {};
+  const promo = state.promoted_metrics || {};
+  const decisions = state.decisions || [];
+  const notify = state.notify || {};
 
   const l3m = promo.l3m_return ?? promo.last3m_1k?.return;
   const l3mProfit = promo.l3m_profit ?? promo.last3m_1k?.profit;
@@ -202,39 +285,41 @@ function render(state) {
           const pass =
             d.comparison === "pass" || (d.proba != null && d.proba >= (d.threshold ?? 0.55));
           const sigCls = d.signal === 1 ? "long" : "flat";
-          return `
-      <tr>
-        <td>${fmtTs(d.synced_at)}</td>
-        <td>${d.bar_date || "—"}</td>
-        <td>${d.proba == null ? "—" : fmtPct1(d.proba)}</td>
-        <td>${fmtPct1(d.threshold ?? 0.55)}</td>
-        <td>${d.gap_to_threshold == null ? "—" : fmtPts(d.gap_to_threshold)}</td>
-        <td><span class="badge ${pass ? "pass" : "fail"}">${pass ? "PASS" : "FAIL"}</span></td>
-        <td><span class="badge ${sigCls}">${d.signal === 1 ? "LONG" : d.signal === 0 ? "FLAT" : "—"}</span></td>
-        <td>${actionLabel(d.action)}</td>
-        <td>${fmtMoney(d.equity)}</td>
-        <td class="wrap">${d.explanation || "—"}</td>
-      </tr>`;
+          const gap =
+            d.gap_to_threshold == null
+              ? "—"
+              : `${(Number(d.gap_to_threshold) * 100).toFixed(1)} pts`;
+          return `<tr>
+            <td>${fmtWhen(d.synced_at)}</td>
+            <td>${d.bar_date || "—"}</td>
+            <td>${d.proba == null ? "—" : fmtPct1(d.proba)}</td>
+            <td>${fmtPct1(d.threshold ?? 0.55)}</td>
+            <td>${gap}</td>
+            <td><span class="badge ${pass ? "pass" : "fail"}">${pass ? "PASS" : "FAIL"}</span></td>
+            <td><span class="badge ${sigCls}">${d.signal === 1 ? "LONG" : d.signal === 0 ? "FLAT" : "—"}</span></td>
+            <td>${actionLabel(d.action)}</td>
+            <td>${fmtMoney(d.equity)}</td>
+            <td class="wrap">${d.explanation || "—"}</td>
+          </tr>`;
         })
         .join("")
-    : `<tr><td colspan="10">No decisions yet — waiting for next sync.</td></tr>`;
+    : `<tr><td colspan="10">No decisions yet.</td></tr>`;
 
   const fills = ((state.ledger && state.ledger.fills) || []).slice().reverse();
   $("fillsBody").innerHTML = fills.length
     ? fills
         .map(
-          (f) => `
-      <tr>
-        <td>${String(f.ts || "").replace("T", " ").slice(0, 19)}</td>
-        <td class="${String(f.side || "").toLowerCase()}">${f.side}</td>
-        <td>${f.source || "—"}</td>
-        <td>${fmtNum(f.shares, 4)}</td>
-        <td>${fmtMoney(f.price)}</td>
-        <td>${fmtMoney(f.cost)}</td>
-      </tr>`
+          (f) => `<tr>
+            <td>${fmtWhen(f.ts)}</td>
+            <td class="${String(f.side || "").toLowerCase() === "buy" ? "buy" : "sell"}">${f.side}</td>
+            <td>${f.source || "—"}</td>
+            <td>${fmtNum(f.shares, 4)}</td>
+            <td>${fmtMoney(f.price)}</td>
+            <td>${fmtMoney(f.cost)}</td>
+          </tr>`
         )
         .join("")
-    : `<tr><td colspan="6">No fills yet — holds do not create trades.</td></tr>`;
+    : `<tr><td colspan="6">No fills yet.</td></tr>`;
 
   const metrics = [
     ["Full CAGR", fmtPct(promo.cagr)],
@@ -248,45 +333,27 @@ function render(state) {
     .map(([k, v]) => `<div><span>${k}</span><strong>${v}</strong></div>`)
     .join("");
 
-  const notify = state.notify || {};
   $("genAt").textContent = [
     `State ${state.generated_at || "—"}`,
     `mode ${state.mode || "paper"}`,
     state.last_sync_reason || "no sync",
+    `v${state.version || "—"}`,
     notify.configured === false
       ? "EMAIL NOT CONFIGURED"
       : notify.ok
         ? `last email via ${notify.via}`
         : notify.error || "alerts ready",
   ].join(" · ");
-
-  const liveEq = ((state.ledger && state.ledger.equity) || [])
-    .map((e) => ({ date: String(e.ts || "").slice(0, 10), equity: Number(e.equity) }))
-    .filter((e) => e.date && !Number.isNaN(e.equity));
-  const btSeries = bt.equity_weekly || [];
-  const usePaperPath =
-    liveEq.length >= 8 &&
-    liveEq[0].date !== liveEq[liveEq.length - 1].date &&
-    btSeries.length === 0;
-  const series = usePaperPath ? liveEq : btSeries.length ? btSeries : liveEq;
-  $("chartHint").textContent = usePaperPath
-    ? "paper ledger marks"
-    : btSeries.length
-      ? "walk-forward backtest (weekly)"
-      : "paper ledger marks";
-  try {
-    drawChart(series);
-  } catch (err) {
-    console.error("chart", err);
-    $("chartHint").textContent = "chart unavailable";
-  }
 }
 
 function drawChart(series) {
   const canvas = $("equityChart");
   if (!canvas || typeof Chart === "undefined") return;
   if (!series || !series.length) {
-    if (chart) chart.destroy();
+    if (chart) {
+      chart.destroy();
+      chart = null;
+    }
     return;
   }
   const labels = series.map((p) => p.date);
@@ -300,12 +367,12 @@ function drawChart(series) {
       datasets: [
         {
           data,
-          borderColor: "#c8f542",
-          backgroundColor: "rgba(200,245,66,0.08)",
+          borderColor: "#c4a574",
+          backgroundColor: "rgba(196,165,116,0.1)",
           borderWidth: 2,
           pointRadius: 0,
           fill: true,
-          tension: 0.2,
+          tension: 0.25,
         },
       ],
     },
@@ -315,62 +382,39 @@ function drawChart(series) {
       plugins: { legend: { display: false } },
       scales: {
         x: {
-          ticks: { color: "#8a9a92", maxTicksLimit: 8, font: { family: "IBM Plex Mono", size: 10 } },
-          grid: { color: "rgba(232,240,230,0.06)" },
+          ticks: { color: "#9a9186", maxTicksLimit: 8, font: { family: "IBM Plex Mono", size: 10 } },
+          grid: { color: "rgba(240,235,227,0.06)" },
         },
         y: {
-          ticks: { color: "#8a9a92", font: { family: "IBM Plex Mono", size: 10 } },
-          grid: { color: "rgba(232,240,230,0.06)" },
+          ticks: { color: "#9a9186", font: { family: "IBM Plex Mono", size: 10 } },
+          grid: { color: "rgba(240,235,227,0.06)" },
         },
       },
     },
   });
 }
 
-async function syncNow() {
-  const btn = $("syncBtn");
-  btn.disabled = true;
-  btn.textContent = "Syncing…";
-  try {
-    const secret = window.localStorage.getItem("CRON_SECRET") || "signal-desk-paper-sync";
-    const res = await fetch(`/api/sync`, {
-      method: "POST",
-      headers: { "X-Cron-Secret": secret },
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      alert(err.detail || `Sync failed (${res.status})`);
-    }
-    render(await loadState());
-  } catch (e) {
-    alert(String(e));
-  } finally {
-    btn.disabled = false;
-    btn.textContent = "Run sync";
-  }
+function render(state) {
+  if ($("sideVersion")) $("sideVersion").textContent = `v${state.version || "0.5.0"}`;
+  renderSimple(state);
+  renderAdvanced(state);
 }
 
 async function refresh() {
   try {
-    const state = await loadState();
-    // enrich with market flag from config if missing
-    if (state.market_open_et == null) {
-      try {
-        const cfg = await (await fetch("/api/config", { cache: "no-store" })).json();
-        state.market_open_et = cfg.market_open_et;
-      } catch (_) {}
-    }
-    render(state);
+    render(await loadState());
   } catch (e) {
     console.error(e);
-    if ($("mEquitySub")) $("mEquitySub").textContent = String(e);
+    if ($("heroStatus")) $("heroStatus").textContent = "Couldn’t reach the desk";
+    if ($("confSentence")) $("confSentence").textContent = String(e);
   }
 }
 
 async function boot() {
+  bindNav();
+  bindTooltip();
   tickClock();
   setInterval(tickClock, 1000);
-  $("syncBtn").addEventListener("click", syncNow);
   await refresh();
   setInterval(refresh, POLL_MS);
 }

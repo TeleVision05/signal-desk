@@ -3,159 +3,211 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Signal Desk — Paper ML</title>
+  <title>Signal Desk — Practice account</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,600;0,9..40,700;1,9..40,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Source+Sans+3:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
   <div class="atmosphere" aria-hidden="true"></div>
-  <header class="top">
-    <div class="brand">
-      <div class="mark">SD</div>
-      <div>
-        <h1>Signal Desk</h1>
-        <p class="sub">Paper · walk-forward ML · TQQQ</p>
+
+  <div class="shell">
+    <aside class="side-nav" aria-label="Main">
+      <div class="brand">
+        <div class="mark">SD</div>
+        <div>
+          <p class="brand-name">Signal Desk</p>
+          <p class="brand-sub">Practice money only</p>
+        </div>
       </div>
+      <nav class="nav-links">
+        <button type="button" class="nav-btn active" data-view="simple">Simple</button>
+        <button type="button" class="nav-btn" data-view="advanced">Advanced</button>
+      </nav>
+      <p class="side-foot" id="sideVersion">v—</p>
+    </aside>
+
+    <div class="main-col">
+      <header class="mobile-bar">
+        <div class="brand compact">
+          <div class="mark">SD</div>
+          <div>
+            <p class="brand-name">Signal Desk</p>
+            <p class="brand-sub">Practice money only</p>
+          </div>
+        </div>
+        <nav class="mobile-tabs" aria-label="Views">
+          <button type="button" class="nav-btn active" data-view="simple">Simple</button>
+          <button type="button" class="nav-btn" data-view="advanced">Advanced</button>
+        </nav>
+      </header>
+
+      <main>
+        <!-- SIMPLE -->
+        <section id="view-simple" class="view active" aria-label="Simple dashboard">
+          <header class="hero">
+            <p class="hero-kicker" id="marketLine">Market —</p>
+            <h1 class="hero-status" id="heroStatus">Checking…</h1>
+            <p class="hero-ticker">
+              <span id="heroAsset">TQQQ</span>
+              <button type="button" class="tip-btn" id="tqqqTip" aria-label="What is TQQQ?" title="TQQQ is a fund that aims to move about 3× the daily return of the Nasdaq-100 (big tech stocks). Practice trades only.">?</button>
+            </p>
+            <p class="hero-money mono" id="heroEquity">—</p>
+            <p class="hero-money-sub">Fake money in this practice account</p>
+          </header>
+
+          <div class="timing-row">
+            <div>
+              <span class="timing-label">Last update</span>
+              <strong id="lastUpdate" class="mono">—</strong>
+            </div>
+            <div>
+              <span class="timing-label">Next update</span>
+              <strong id="nextUpdate" class="mono">—</strong>
+            </div>
+          </div>
+          <p class="email-line" id="emailLine">Trade emails: —</p>
+
+          <article class="panel confidence-panel">
+            <div class="panel-h">
+              <h2>Bot confidence</h2>
+              <span class="hint" id="confLevel">—</span>
+            </div>
+            <p class="conf-sentence" id="confSentence">Waiting for the next update…</p>
+            <div class="conf-track" aria-label="Confidence meter">
+              <div class="conf-zones">
+                <span>Low</span><span>Maybe</span><span>High</span>
+              </div>
+              <div class="conf-bar">
+                <div class="conf-fill" id="confFill"></div>
+                <div class="conf-threshold" id="confThreshold" style="left:55%"></div>
+                <div class="conf-marker" id="confMarker" style="left:0%"></div>
+              </div>
+              <div class="conf-scale">
+                <span>0%</span>
+                <span>Buys above 55%</span>
+                <span>100%</span>
+              </div>
+            </div>
+            <p class="conf-action" id="confAction"></p>
+          </article>
+
+          <article class="panel">
+            <div class="panel-h">
+              <h2>Fake money over time</h2>
+              <span class="hint">practice account</span>
+            </div>
+            <canvas id="equityChart" height="110"></canvas>
+            <p class="footnote" id="chartHint">Paper equity only</p>
+          </article>
+
+          <article class="panel">
+            <div class="panel-h">
+              <h2>Recent trades</h2>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>When</th>
+                    <th>Bought or Sold</th>
+                    <th>Why</th>
+                    <th>$ amount</th>
+                  </tr>
+                </thead>
+                <tbody id="tradesBody"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-h">
+              <h2>Update history</h2>
+              <span class="hint">last 10 checks</span>
+            </div>
+            <ul class="update-log" id="updateLog"></ul>
+          </article>
+        </section>
+
+        <!-- ADVANCED -->
+        <section id="view-advanced" class="view" hidden aria-label="Advanced dashboard">
+          <p class="adv-intro">Raw numbers and model details. The Simple tab is enough for day-to-day.</p>
+
+          <article class="panel">
+            <div class="panel-h">
+              <h2>Decision log</h2>
+              <span class="hint">p(up) vs threshold</span>
+            </div>
+            <div class="table-wrap tall">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Synced</th>
+                    <th>Bar</th>
+                    <th>p(up)</th>
+                    <th>Threshold</th>
+                    <th>Gap</th>
+                    <th>Result</th>
+                    <th>Signal</th>
+                    <th>Action</th>
+                    <th>Equity</th>
+                    <th>What happened</th>
+                  </tr>
+                </thead>
+                <tbody id="decisionsBody"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <div class="grid-2">
+            <article class="panel">
+              <div class="panel-h">
+                <h2>Strategy</h2>
+              </div>
+              <p class="backtest-chip"><span>Last 3m backtest</span><strong id="m3m" class="mono">—</strong></p>
+              <dl class="kv" id="strategyCard"></dl>
+              <div class="features" id="featureList"></div>
+            </article>
+            <article class="panel">
+              <div class="panel-h">
+                <h2>Key metrics</h2>
+              </div>
+              <div class="metric-grid" id="promoMetrics"></div>
+              <p class="footnote" id="genAt"></p>
+            </article>
+          </div>
+
+          <article class="panel">
+            <div class="panel-h">
+              <h2>Raw fills</h2>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>When</th><th>Side</th><th>Reason</th><th>Shares</th><th>Price</th><th>Cost</th></tr>
+                </thead>
+                <tbody id="fillsBody"></tbody>
+              </table>
+            </div>
+          </article>
+
+          <p class="raw-link"><a href="/api/state" target="_blank" rel="noreferrer">Open raw state JSON</a></p>
+        </section>
+      </main>
+
+      <footer>
+        <span>Signal Desk · practice paper trading</span>
+        <span id="clock" class="mono"></span>
+      </footer>
     </div>
-    <div class="top-meta">
-      <span id="modePill" class="pill">PAPER</span>
-      <span id="clock" class="mono"></span>
-    </div>
-  </header>
+  </div>
 
-  <main>
-    <p id="liveStatus" class="live-status">Connecting…</p>
-    <section class="hero-metrics" id="heroMetrics">
-      <article class="metric">
-        <span class="label">Paper equity</span>
-        <strong id="mEquity" class="mono">—</strong>
-        <em id="mEquitySub">waiting for sync</em>
-      </article>
-      <article class="metric">
-        <span class="label">Signal</span>
-        <strong id="mSignal" class="mono">—</strong>
-        <em id="mSignalSub">model probability</em>
-      </article>
-      <article class="metric">
-        <span class="label">p(up)</span>
-        <strong id="mProba" class="mono">—</strong>
-        <em id="mProbaSub">vs threshold</em>
-      </article>
-      <article class="metric">
-        <span class="label">Position</span>
-        <strong id="mPos" class="mono">—</strong>
-        <em id="mPosSub">shares · mark</em>
-      </article>
-    </section>
+  <div class="tip-pop" id="tipPop" hidden role="tooltip">
+    TQQQ is a fund that aims to move about 3× the daily return of the Nasdaq-100 (big tech stocks). This desk only uses fake money.
+  </div>
 
-    <section class="panel wide decision-panel">
-      <div class="panel-h">
-        <h2>Latest comparison</h2>
-        <span class="hint" id="decisionBarHint">p(up) vs 55% threshold</span>
-      </div>
-      <p class="decision-explain" id="decisionExplain">Waiting for first sync…</p>
-      <div class="proba-track" aria-label="Probability versus threshold">
-        <div class="proba-fill" id="probaFill"></div>
-        <div class="proba-threshold" id="probaThreshold" style="left:55%"></div>
-        <div class="proba-marker" id="probaMarker" style="left:0%"></div>
-      </div>
-      <div class="proba-scale">
-        <span>0%</span>
-        <span id="thrLabel">threshold 55%</span>
-        <span>100%</span>
-      </div>
-      <div class="decision-stats" id="decisionStats"></div>
-    </section>
-
-    <section class="grid-2">
-      <div class="panel">
-        <div class="panel-h">
-          <h2>Equity path</h2>
-          <span class="hint" id="chartHint">weekly marks</span>
-        </div>
-        <canvas id="equityChart" height="120"></canvas>
-      </div>
-      <div class="panel">
-        <div class="panel-h">
-          <h2>Strategy card</h2>
-          <span class="hint" id="m3mHint">3m backtest</span>
-        </div>
-        <p class="backtest-chip"><span>Last 3m</span><strong id="m3m" class="mono">—</strong></p>
-        <dl class="kv" id="strategyCard"></dl>
-        <div class="features" id="featureList"></div>
-      </div>
-    </section>
-
-    <section class="panel wide">
-      <div class="panel-h">
-        <h2>Decision log</h2>
-        <button id="syncBtn" type="button">Run sync</button>
-      </div>
-      <p class="footnote tight">Each row is one sync: model p(up), the 55% threshold comparison, signal, and what the paper book did.</p>
-      <div class="table-wrap tall">
-        <table>
-          <thead>
-            <tr>
-              <th>Synced</th>
-              <th>Bar</th>
-              <th>p(up)</th>
-              <th>Threshold</th>
-              <th>Gap</th>
-              <th>Result</th>
-              <th>Signal</th>
-              <th>Action</th>
-              <th>Equity</th>
-              <th>What happened</th>
-            </tr>
-          </thead>
-          <tbody id="decisionsBody"></tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="grid-2">
-      <div class="panel">
-        <div class="panel-h">
-          <h2>Live paper trades</h2>
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr><th>When</th><th>Side</th><th>Reason</th><th>Shares</th><th>Price</th><th>Cost</th></tr>
-            </thead>
-            <tbody id="fillsBody"></tbody>
-          </table>
-        </div>
-      </div>
-      <div class="panel">
-        <div class="panel-h">
-          <h2>Key metrics</h2>
-        </div>
-        <div class="metric-grid" id="promoMetrics"></div>
-        <p class="footnote" id="genAt"></p>
-      </div>
-    </section>
-
-    <section class="panel wide">
-      <div class="panel-h">
-        <h2>How to read this desk</h2>
-      </div>
-      <p class="prose">
-        This is <strong>paper money only</strong> on one host: the Render backend trades, serves this UI, and
-        emails you on fills. Each sync recomputes walk-forward HistGradientBoosting p(up) for TQQQ.
-        If <strong>p(up) ≥ 55%</strong> → LONG, else FLAT; then the paper book buys, sells, stops, or holds.
-        This page refreshes live every 30s. Syncs run weekdays around open, hourly in RTH, after close, or via Run sync.
-      </p>
-    </section>
-  </main>
-
-  <footer>
-    <span>Signal Desk · TeleVision05</span>
-    <a href="/api/state" target="_blank" rel="noreferrer">raw state JSON</a>
-  </footer>
   <script src="/static/app.js"></script>
 </body>
 </html>

@@ -6,7 +6,7 @@ import json
 import os
 import threading
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -25,10 +25,23 @@ CRON_SECRET = os.environ.get("CRON_SECRET", "signal-desk-paper-sync")
 INITIAL_CASH = float(os.environ.get("PAPER_CASH", "1000"))
 ALLOW_PUBLIC_SYNC = os.environ.get("ALLOW_PUBLIC_SYNC", "1") == "1"
 ET = ZoneInfo("America/New_York")
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 _sync_lock = threading.Lock()
 _scheduler: BackgroundScheduler | None = None
+
+# Official update slots (UTC), matching in-process APScheduler jobs.
+_SYNC_WEEKDAY_SLOTS: tuple[tuple[int, int], ...] = (
+    (13, 35),  # preopen
+    (14, 5),
+    (15, 5),
+    (16, 5),
+    (17, 5),
+    (18, 5),
+    (19, 5),
+    (20, 5),  # RTH hourly
+    (21, 15),  # after close
+)
 
 
 def _us_equity_session_open(now: datetime | None = None) -> bool:
@@ -42,6 +55,28 @@ def _us_equity_session_open(now: datetime | None = None) -> bool:
         return False
     minutes = now.hour * 60 + now.minute
     return (9 * 60 + 30) <= minutes <= (16 * 60)
+
+
+def _next_scheduled_sync(now: datetime | None = None) -> datetime:
+    """Next weekday sync slot in UTC (preopen / RTH hourly / after close)."""
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
+    # Search up to two weeks ahead for the next Mon–Fri slot.
+    for day_offset in range(0, 14):
+        day = (now + timedelta(days=day_offset)).date()
+        if day.weekday() >= 5:
+            continue
+        for hour, minute in _SYNC_WEEKDAY_SLOTS:
+            candidate = datetime(day.year, day.month, day.day, hour, minute, tzinfo=timezone.utc)
+            if candidate > now:
+                return candidate
+    # Fallback: following Monday preopen
+    days_ahead = (7 - now.weekday()) % 7 or 7
+    monday = (now + timedelta(days=days_ahead)).date()
+    return datetime(monday.year, monday.month, monday.day, 13, 35, tzinfo=timezone.utc)
 
 
 def _run_paper_sync(*, reason: str = "manual") -> dict:
@@ -140,6 +175,9 @@ def health():
 def state():
     data = load_state()
     data["notify"] = load_notify_status()
+    data["market_open_et"] = _us_equity_session_open()
+    data["next_sync_at"] = _next_scheduled_sync().isoformat()
+    data["version"] = VERSION
     return data
 
 
@@ -158,6 +196,7 @@ def config():
         "paper_cash": INITIAL_CASH,
         "market_open_et": _us_equity_session_open(),
         "schedules": ["preopen 13:35 UTC", "rth hourly 14-20 UTC", "after_close 21:15 UTC"],
+        "next_sync_at": _next_scheduled_sync().isoformat(),
         "trade_alert_email": os.environ.get("TRADE_ALERT_EMAIL", "tarun.vadapalli.1@gmail.com"),
         "email_ready": email_configured(),
         "version": VERSION,
