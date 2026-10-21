@@ -19,8 +19,10 @@ from .dashboard_state import STATE_PATH, build_state, ensure_dashboard_state, lo
 
 ROOT = Path(__file__).resolve().parents[2]
 STATIC = ROOT / "dashboard" / "static"
-CRON_SECRET = os.environ.get("CRON_SECRET", "dev-paper-secret")
+CRON_SECRET = os.environ.get("CRON_SECRET", "signal-desk-paper-sync")
 INITIAL_CASH = float(os.environ.get("PAPER_CASH", "1000"))
+# Paper-only desk: allow browser Run sync without a shared secret by default.
+ALLOW_PUBLIC_SYNC = os.environ.get("ALLOW_PUBLIC_SYNC", "1") == "1"
 ET = ZoneInfo("America/New_York")
 
 _sync_lock = threading.Lock()
@@ -126,10 +128,21 @@ def state():
 
 @app.post("/api/sync")
 def sync(x_cron_secret: str | None = Header(default=None)):
-    if x_cron_secret != CRON_SECRET:
+    authed = x_cron_secret == CRON_SECRET or ALLOW_PUBLIC_SYNC
+    if not authed:
         raise HTTPException(status_code=401, detail="invalid cron secret")
     info = _run_paper_sync(reason="api")
     return {"ok": True, "paper": info}
+
+
+@app.get("/api/config")
+def config():
+    return {
+        "paper_cash": INITIAL_CASH,
+        "allow_public_sync": ALLOW_PUBLIC_SYNC,
+        "market_open_et": _us_equity_session_open(),
+        "schedules": ["preopen 13:35 UTC", "rth hourly 14-20 UTC", "after_close 21:15 UTC"],
+    }
 
 
 @app.get("/")

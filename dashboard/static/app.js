@@ -210,7 +210,7 @@ async function syncNow() {
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      alert(err.detail || `Sync failed (${res.status}). Set localStorage CRON_SECRET to match Render.`);
+      alert(err.detail || `Sync failed (${res.status}). On Render set CRON_SECRET=signal-desk-paper-sync or ALLOW_PUBLIC_SYNC=1, then Manual Deploy.`);
     }
     render(await loadState());
   } catch (e) {

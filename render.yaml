@@ -10,5 +10,7 @@ services:
       # Shared with GitHub Action wake/sync (paper-only; rotate anytime in Render env)
       - key: CRON_SECRET
         value: signal-desk-paper-sync
+      - key: ALLOW_PUBLIC_SYNC
+        value: "1"
       - key: PYTHONUNBUFFERED
         value: "1"
