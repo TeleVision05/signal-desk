@@ -27,7 +27,7 @@ CRON_SECRET = os.environ.get("CRON_SECRET", "signal-desk-paper-sync")
 INITIAL_CASH = float(os.environ.get("PAPER_CASH", "1000"))
 ALLOW_PUBLIC_SYNC = os.environ.get("ALLOW_PUBLIC_SYNC", "1") == "1"
 ET = ZoneInfo("America/New_York")
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 
 _sync_lock = threading.Lock()
 _scheduler: BackgroundScheduler | None = None

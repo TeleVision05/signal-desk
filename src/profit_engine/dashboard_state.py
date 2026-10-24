@@ -223,13 +223,35 @@ def build_state(*, include_backtest: bool = True) -> dict:
     return state
 
 
+def _live_book_slice(book_id: str, cached: dict | None = None) -> dict:
+    """Always pull ledger/decisions/paper from durable store (Postgres), not ephemeral JSON.
+
+    Free Render wipes /app/data on spin-down; dashboard_state.json can look empty/stale
+    even when paper fills still exist in Supabase.
+    """
+    base = dict(cached or {})
+    fresh = build_book_slice(book_id)
+    # Prefer live durable fields; keep heavier backtest/promo from cache if present.
+    for key in ("ledger", "paper", "decisions", "strategy", "run_id", "label", "asset", "tip", "session"):
+        if fresh.get(key) is not None:
+            base[key] = fresh[key]
+    if not base.get("backtest"):
+        base["backtest"] = fresh.get("backtest") or {}
+    if not base.get("promoted_metrics"):
+        base["promoted_metrics"] = fresh.get("promoted_metrics") or {}
+    base.setdefault("id", book_id)
+    return base
+
+
 def project_active_book(state: dict, book_id: str | None) -> dict:
     """Copy selected book fields to top-level for the UI."""
     book = resolve_book(book_id)
     bid = book["id"]
-    books = state.get("books") or {}
-    slice_ = books.get(bid) or build_book_slice(bid)
+    books = dict(state.get("books") or {})
+    slice_ = _live_book_slice(bid, books.get(bid))
+    books[bid] = slice_
     out = dict(state)
+    out["books"] = books
     out["active_book"] = bid
     out["run_id"] = slice_.get("run_id")
     out["strategy"] = slice_.get("strategy") or STRATEGY_META.get(bid, {})
