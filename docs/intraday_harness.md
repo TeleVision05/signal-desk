@@ -35,7 +35,7 @@ agents; `load_klines` only reads the cache, so agents never race on the download
 | `backtest` | `run_backtest(df, target, cost_bps_per_side)`, `buy_and_hold`, `vol_matched_buy_and_hold` | `target[t]` decided at `t` close, filled at `t+1` open, P&L open-to-open. `target` must be a float or a Series on the bars' own timestamps |
 | `metrics` | `summarize(result)` | daily-P&L Sharpe (sqrt 365), Sortino, CAGR, MaxDD, PF, t-stats, months, years |
 | `overfitting` | `dsr_from_daily`, `pbo_cscv`, `permutation_test` | per-period (daily) Sharpe throughout |
-| `trials` | `log_trial(...)`, `n_trials()`, `returns_matrix()` | append-only JSONL + one parquet per call; counts RUNS (config x seed x code x data); OOS window only |
+| `trials` | `log_trial(...)`, `n_trials()`, `returns_matrix()` | append-only JSONL + one parquet per call; counts RUNS (config x seed x code x data x returns); series must cover the whole OOS window |
 | `promotion` | `evaluate(Candidate)`, `verdict(table)`, `holdout_check(...)` | PASS only if every row passes on both symbols |
 | `holdout` | `open_holdout(reason=...)` | the only way past 2026-07-01; audited |
 
@@ -61,6 +61,13 @@ P&L of target[t] = open_{t+2} / open_{t+1} - 1   (minus cost on |Δposition|)
   raises rather than silently becoming a flat book.
 * Data gaps are flagged, not hidden: `result.bars["span_bars"]` (> 1 across a hole), trade
   columns `crosses_gap` and `holding_time`, and `result.params["bars_held_across_gap"]`.
+* Halted bars (`volume == 0`, open = stale previous close) are not tradeable: a fill due on
+  one is deferred to the next bar with volume, and the earlier position is carried (it earns
+  the halt move it was really exposed to). See `params["n_stale_bars"]`,
+  `params["fills_deferred"]` and the trade column `crosses_stale`. A frame without a
+  `volume` column gets no halt detection (`params["stale_check"]` is False).
+* The bar index must be a tz-aware, strictly increasing DatetimeIndex. An unsorted or
+  duplicated frame (an unsorted `concat`) raises instead of inventing P&L.
 * Days are UTC calendar days; every day in the span is in `result.daily` (0 when flat).
 
 ## End-to-end example
@@ -112,7 +119,10 @@ print(table.to_string(index=False), promotion.verdict(table))
    `HoldoutViolation` in `load_klines`, both label functions, all three splitters,
    `run_backtest`, every public `metrics` helper, `dsr_from_daily` / `pbo_cscv` (DataFrame) /
    `permutation_test`, `log_trial` and `promotion`. A result built inside `open_holdout`
-   still raises when analysed after the block closes. Raw plumbing (`binance.*`,
+   still raises when analysed after the block closes. The guard fails closed: a frame or
+   series whose index is not a DatetimeIndex (e.g. after `reset_index`) raises `TypeError`.
+   Even inside `open_holdout`, `log_trial` refuses any series reaching `EVAL_END` and
+   `promotion.evaluate` refuses to run: holdout results go only to `holdout_check`. Raw plumbing (`binance.*`,
    `sync_cache`, `resample`, `features`) is not guarded; its output reaches a score only
    through a guarded call.
    `open_holdout(reason=...)` exists for ONE final check of a candidate that already PASSed
@@ -120,12 +130,16 @@ print(table.to_string(index=False), promotion.verdict(table))
    appended to `research/intraday/holdout_access.jsonl` with the reason and caller. The path
    is not a parameter (tests monkeypatch `config.HOLDOUT_AUDIT_LOG`).
 2. **Log every run you evaluate**, winners and losers, at base cost and at stress cost:
-   `trials.log_trial(...)`. The DSR deflates by the distinct-RUN count across ALL families,
-   where a run is (family, params, timeframe, symbol, seed, git sha, data hash): a new seed,
-   a code change or new data is a new trial, and each run keeps its own return series for
-   PBO. Commit experiment code: the git sha covers tracked files (an uncommitted diff is
-   hashed in), not untracked scripts. Log only the OOS series over `[EVAL_START, EVAL_END)`;
-   anything earlier raises. An unlogged run makes every other result look better than it is.
+   `trials.log_trial(...)`. The DSR deflates by the distinct-RUN count across ALL families
+   and kinds (benchmarks included), where a run is (family, params, timeframe, symbol, seed,
+   git sha, data hash) plus a hash of its logged returns: a new seed, a code change (even in
+   an untracked script) or new data is a new trial; an identical re-run is not, and neither
+   is re-scoring the same spec at stress cost. Each run keeps its own return series for PBO.
+   Still commit experiment code, so a run can be reproduced. The series must cover the OOS
+   window `[EVAL_START, EVAL_END)` to within 7 days at each end; a partial, earlier or later
+   series raises. The registry computes each run's Sharpe from the saved returns; the
+   `sharpe` / `sharpe_daily` you pass in `metrics` are overwritten. An unlogged run makes
+   every other result look better than it is.
 3. **One family per agent** (e.g. `rule_baselines`, `logreg`, `lgbm`, `meta_label`,
    `voltarget_trend`). Each family is its own JSONL file, so parallel agents never append
    to the same file. Rule baselines log with `kind="baseline"`; promotion requires beating
@@ -158,7 +172,7 @@ Walk-forward OOS 2020-01-01..2026-06-30, each of BTCUSDT and ETHUSDT separately:
 | best month share of total (log) P&L | < 30% |
 | Sharpe beats buy-and-hold, vol-matched buy-and-hold, best `kind="baseline"` trial | > |
 | random-timing permutation p (same trades and gaps, shuffled order) | < 0.05 |
-| backtest starts in [2020-01-01, +7 days] and ends within 7 days of 2026-06-30 | yes |
+| backtest starts in [2020-01-01, +7 days] and ends in [2026-06-24, 2026-07-01) | yes |
 | stress run holds the base positions on the same bars; `bars` equals the base bars | yes |
 | costs are 5 and 10, config is logged | yes |
 
@@ -173,6 +187,7 @@ Holdout (`promotion.holdout_check`, only inside `open_holdout`): net P&L > 0 and
 | missing 5m bars | 1,944 (0.20%) in 32 gaps; largest 2018-02-08 00:25 .. 2018-02-10 06:15 (645 bars) |
 | off-grid bars dropped | 241 per symbol (2018 restart timestamps like `09:58:14.789`) |
 | incomplete resampled bars 2017-09..2026-06 | 15m: 12, 1h: 28, 4h: 48 |
+| zero-volume (halted) 5m bars | BTC 493, ETH 1,448 before 2026-07-01 (42 each in 2020-01..2026-06); 932 / 1,817 through 2026-11-05 per the sanity summary (audit round 2; re-check: `(load_klines(sym)["volume"] <= 0).sum()`) |
 | buy-and-hold 2020-01..2026-06 @5bps | BTC Sharpe 0.84, MaxDD -77%; ETH Sharpe 0.89, MaxDD -79% |
 
 ## Known limitations
@@ -182,5 +197,6 @@ Holdout (`promotion.holdout_check`, only inside `open_holdout`): net P&L > 0 and
   the whole distance from the drifted weight (no partial or banded rebalancing).
 * The permutation test measures timing skill only; a high-turnover strategy can pass it and
   still lose money after costs (other criteria catch that).
-* PBO needs at least 2 logged trials for the symbol and uses only the dates all trials share.
+* PBO needs at least 2 logged trials for the symbol and uses only the dates all trials share
+  (every logged series covers the window to within 7 days, so this trims at most the edges).
 * The holdout guard prevents accidents; it is not a security boundary.

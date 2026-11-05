@@ -11,6 +11,9 @@ caller is inside ``with open_holdout(reason=...)``, which first appends an audit
 ``config.HOLDOUT_AUDIT_LOG`` (``research/intraday/holdout_access.jsonl``). The path is not
 a parameter: tests isolate it by monkeypatching ``config.HOLDOUT_AUDIT_LOG``.
 
+The guard fails closed: an index that is not a DatetimeIndex (e.g. after ``reset_index``) or
+a scalar that is not datetime-like raises ``TypeError`` rather than being read as a time.
+
 Not guarded (raw plumbing, not scoring): ``binance.*`` downloaders, ``data.sync_cache``,
 ``resample`` and ``features``. Their output only reaches a score through a guarded call.
 
@@ -24,9 +27,10 @@ import contextvars
 import getpass
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from profit_engine.intraday import config
@@ -85,16 +89,30 @@ class open_holdout:  # noqa: N801 - used as a context manager, reads like a func
             self._token = None
 
 
+_TIME_SCALARS = (pd.Timestamp, date, np.datetime64, str)
+
+
 def _latest(ts: object) -> pd.Timestamp | None:
-    """Largest timestamp in a scalar / index / Series / DataFrame index, or None if empty."""
+    """Largest timestamp in a scalar / index / Series / DataFrame index, or None if empty.
+
+    Fails closed: an index that is not a DatetimeIndex, or a scalar that is not datetime-like
+    (an int would read as nanoseconds after 1970), raises TypeError instead of passing.
+    """
     if isinstance(ts, (pd.Series, pd.DataFrame)):
         ts = ts.index
     if isinstance(ts, pd.Index):
         if len(ts) == 0:
             return None
+        if not isinstance(ts, pd.DatetimeIndex):
+            raise TypeError(
+                f"holdout guard needs a DatetimeIndex, got {type(ts).__name__}: "
+                "keep the timestamps on the index (no reset_index) so the guard can read them"
+            )
         ts = ts.max()
     if ts is None:
         return None
+    if not isinstance(ts, _TIME_SCALARS):
+        raise TypeError(f"holdout guard needs a datetime-like value, got {type(ts).__name__}")
     out = pd.Timestamp(ts)
     return out.tz_localize("UTC") if out.tzinfo is None else out.tz_convert("UTC")
 

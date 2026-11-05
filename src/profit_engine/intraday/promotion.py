@@ -3,11 +3,15 @@
 Inputs are walk-forward OOS backtests over ``[EVAL_START, EVAL_END)`` at base (5 bps/side)
 and stress (10 bps/side) cost, plus the bar frames they ran on (for the buy-and-hold
 benchmarks). The gate checks its own inputs: the base backtest must start inside
-``[EVAL_START, EVAL_START + 7D]`` (no pre-2020 P&L), the stress run must hold the same
+``[EVAL_START, EVAL_START + 7D]`` (no pre-2020 P&L) and end inside ``[EVAL_END - 7D, EVAL_END)``
+(no holdout P&L, whether or not the holdout is open), the stress run must hold the same
 positions on the same bars, and ``bars`` must be the base backtest's bars (benchmarks are
 always computed on the base window, so a wider frame cannot flatter the strategy).
 The candidate must already be in the trial registry: the DSR uses the total distinct-run
 count across ALL families and PBO uses the registry's return matrix.
+
+``evaluate`` refuses to run inside ``open_holdout``: it scores the walk-forward window only.
+The holdout has its own gate, :func:`holdout_check`.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ from profit_engine.intraday.holdout import HoldoutViolation, assert_pre_holdout,
 from profit_engine.intraday.metrics import sharpe, summarize
 from profit_engine.intraday.overfitting import dsr_from_daily, pbo_cscv, permutation_test
 
-COVERAGE_SLACK = pd.Timedelta("7D")
+COVERAGE_SLACK = config.COVERAGE_SLACK
 
 
 @dataclass
@@ -68,9 +72,8 @@ def _registry_rows(c: Candidate, sym: str, base: BacktestResult, m: dict, trials
 def _consistency_rows(sym: str, base: BacktestResult, stress: BacktestResult, bars: pd.DataFrame) -> list[dict]:
     """The stress run and the benchmark bars must belong to the base backtest, bar for bar."""
     first, last = base.bars.index[0], base.bars.index[-1]
-    covers = config.EVAL_START <= first <= config.EVAL_START + COVERAGE_SLACK and last >= (
-        config.EVAL_END - COVERAGE_SLACK
-    )
+    starts_ok = config.EVAL_START <= first <= config.EVAL_START + COVERAGE_SLACK
+    covers = starts_ok and config.EVAL_END - COVERAGE_SLACK <= last < config.EVAL_END
     same_stress = stress.bars.index.equals(base.bars.index) and np.array_equal(
         stress.bars["position"].to_numpy(), base.bars["position"].to_numpy()
     )
@@ -136,6 +139,11 @@ def _symbol_rows(c: Candidate, sym: str, trials_dir: Path | None, n_perm: int, s
 
 def evaluate(candidate: Candidate, trials_dir: Path | None = None, n_perm: int = 500, seed: int = 0) -> pd.DataFrame:
     """PASS/FAIL table (one row per symbol x criterion). Use :func:`verdict` for the overall call."""
+    if holdout_is_open():
+        raise HoldoutViolation(
+            "promotion.evaluate scores the walk-forward window only; run it outside open_holdout "
+            "and use holdout_check inside it"
+        )
     rows = []
     for sym in config.SYMBOLS:
         present = sym in candidate.base and sym in candidate.stress and sym in candidate.bars

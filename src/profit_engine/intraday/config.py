@@ -22,6 +22,9 @@ EVAL_START = pd.Timestamp("2020-01-01", tz="UTC")
 # unless the caller is inside ``holdout.open_holdout(reason=...)``.
 HOLDOUT_START = pd.Timestamp("2026-07-01", tz="UTC")
 EVAL_END = HOLDOUT_START  # exclusive
+# A walk-forward OOS series must start within this of EVAL_START and end within this of
+# EVAL_END (warm-up / last-bar slack). Used by the trial registry and the promotion gate.
+COVERAGE_SLACK = pd.Timedelta("7D")
 
 BASE_COST_BPS = 5.0
 STRESS_COST_BPS = 10.0

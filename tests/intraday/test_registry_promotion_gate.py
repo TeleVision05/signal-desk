@@ -49,11 +49,14 @@ def test_registry_counts_code_and_data_changes_and_never_overwrites(isolated, mo
     monkeypatch.setattr(trials, "git_sha", lambda: "sha_b")
     _log(0, "data_2")  # same params, seed and data, new code
     assert trials.n_trials() == 3
-    _log(0, "data_2", returns=_daily(99))  # identical identity re-logged: same trial, latest wins
+    _log(0, "data_2")  # identical run re-logged (same returns): same trial
     assert trials.n_trials() == 3
-    assert len(list((config.TRIALS_DIR / "returns" / "lgbm").glob("*.parquet"))) == 4
+    # Same declared spec, different returns (e.g. an untracked script changed): a new trial.
+    _log(0, "data_2", returns=_daily(99))
+    assert trials.n_trials() == 4
+    assert len(list((config.TRIALS_DIR / "returns" / "lgbm").glob("*.parquet"))) == 5
     mat = trials.returns_matrix("BTCUSDT")
-    assert mat.shape[1] == 3
+    assert mat.shape[1] == 4
     assert any(np.allclose(mat[c].to_numpy(), _daily(99).to_numpy()) for c in mat.columns)
 
 

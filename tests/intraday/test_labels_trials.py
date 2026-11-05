@@ -12,7 +12,7 @@ from profit_engine.intraday import config, trials
 from profit_engine.intraday.backtest import run_backtest
 from profit_engine.intraday.holdout import HoldoutViolation
 from profit_engine.intraday.labels import triple_barrier
-from profit_engine.intraday.metrics import summarize
+from profit_engine.intraday.metrics import sharpe, summarize
 from profit_engine.intraday.promotion import Candidate, evaluate, verdict
 
 
@@ -66,11 +66,11 @@ def test_registry_counts_distinct_configs_and_saves_returns(isolated):
             trials.log_trial("lr", {"thr": thr}, "15m", "BTCUSDT", cost, m, _daily(int(thr * 100)), "h", 7)
     trials.log_trial("rules", {"fast": 10}, "1h", "BTCUSDT", 5.0, m, _daily(1), "h", 7, kind="baseline")
     trials.log_trial("bench", {}, "1h", "BTCUSDT", 5.0, m, _daily(2), "h", None, kind="benchmark")
-    assert trials.n_trials() == 4  # 3 thresholds + 1 baseline; cost re-scoring and benchmarks excluded
+    assert trials.n_trials() == 5  # 3 thresholds + 1 baseline + 1 benchmark; cost re-scoring excluded
     rec = json.loads((config.TRIALS_DIR / "lr.jsonl").read_text().splitlines()[0])
     assert {"git_sha", "data_hash", "seed", "params", "timeframe", "symbol", "metrics"} <= rec.keys()
-    assert trials.returns_matrix("BTCUSDT").shape[1] == 4
-    assert trials.best_baseline_sharpe("BTCUSDT") == 0.5
+    assert trials.returns_matrix("BTCUSDT").shape[1] == 5
+    assert trials.best_baseline_sharpe("BTCUSDT") == pytest.approx(sharpe(_daily(1)))  # not the caller's 0.5
     with pytest.raises(HoldoutViolation):
         late = pd.Series([0.0], index=[pd.Timestamp("2026-07-02", tz="UTC")])
         trials.log_trial("lr", {"thr": 1}, "15m", "BTCUSDT", 5.0, m, late, "h", 7)
@@ -82,7 +82,9 @@ def test_promotion_fails_loudly_on_a_mediocre_candidate(isolated, bar_factory):
         df = bar_factory(n=288 * 40, seed=20 + i, start="2020-01-01")
         target = (df["close"].pct_change(12) > 0).astype(float)
         bars[sym], base[sym], stress[sym] = df, run_backtest(df, target, 5), run_backtest(df, target, 10)
-        trials.log_trial("mom", {"h": 12}, "5m", sym, 5.0, summarize(base[sym]), base[sym].daily, "h", 0)
+        # The 40-day backtest is too short for the registry (it must cover the OOS window);
+        # the "logged in trial registry" row only needs this config to be logged.
+        trials.log_trial("mom", {"h": 12}, "5m", sym, 5.0, summarize(base[sym]), _daily(30 + i), "h", 0)
     table = evaluate(Candidate("mom", {"h": 12}, "5m", base, stress, bars), n_perm=50)
     assert verdict(table) == "FAIL"
     assert set(table["symbol"]) == set(config.SYMBOLS)

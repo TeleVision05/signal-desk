@@ -24,6 +24,17 @@ bar with ``span_bars > 1`` crossed a data gap: the trade ledger flags it (``cros
 ``holding_time``) and ``params`` counts it. P&L across a gap is the real pre-gap open to
 post-gap open move (no stale fill).
 
+Halted bars: a bar with ``volume == 0`` (Binance prints the stale previous close as its open
+during an exchange halt) is not tradeable. A fill that would land on it is deferred to the
+next bar with volume, and the position held before it is carried meanwhile, so it earns the
+halt move it was really exposed to. ``params`` counts ``n_stale_bars`` and ``fills_deferred``;
+the ledger flags trades held over a halted bar (``crosses_stale``). The forced exit on the last
+bar happens even if it is halted (``forced_exit_on_stale``). A frame without a ``volume``
+column has no halt detection (``params["stale_check"]`` is False).
+
+The bar index must be a tz-aware DatetimeIndex, strictly increasing (ValueError otherwise):
+an unsorted or duplicated frame would compute P&L across time-travelling "next opens".
+
 Days are UTC calendar days; every day in the span appears in the daily series (0 when flat
 or when the exchange had no bars).
 """
@@ -74,6 +85,21 @@ def _validate_target(df: pd.DataFrame, target: pd.Series | float) -> np.ndarray:
     if finite.size and (finite.min() < 0 or finite.max() > 1):
         raise ValueError(f"long/flat only: target must be in [0, 1], got [{finite.min()}, {finite.max()}]")
     return np.nan_to_num(tgt, nan=0.0)
+
+
+def _check_index(idx: pd.Index) -> None:
+    if not isinstance(idx, pd.DatetimeIndex) or idx.tz is None:
+        raise ValueError(f"bars need a tz-aware DatetimeIndex, got {type(idx).__name__} tz={getattr(idx, 'tz', None)}")
+    if not idx.is_monotonic_increasing or not idx.is_unique:
+        raise ValueError("bars index must be strictly increasing (sorted, no duplicate timestamps)")
+
+
+def _defer_stale(held: np.ndarray, stale: np.ndarray) -> tuple[np.ndarray, int]:
+    """Carry the previous position over halted bars (no fill there). Returns (held, n_deferred)."""
+    out = held.copy()
+    for j in np.flatnonzero(stale[1:-1]) + 1:  # bar 0 is flat anyway; the last bar always exits
+        out[j] = out[j - 1]
+    return out, int((out != held).sum())
 
 
 def _drifted(h: np.ndarray, rel: np.ndarray) -> np.ndarray:
@@ -134,7 +160,7 @@ def _apply_constraints(held: np.ndarray, day: np.ndarray, max_rt: int | None, mi
 def _trade_ledger(
     idx: pd.DatetimeIndex, opens: np.ndarray, held: np.ndarray, lg: np.ndarray, ln: np.ndarray, extra: dict
 ) -> pd.DataFrame:
-    cost, gap = extra["cost"], extra["span"] > 1 + 1e-9
+    cost, gap, stale = extra["cost"], extra["span"] > 1 + 1e-9, extra["stale"]
     in_mkt = (held > 0).astype(int)
     edges = np.diff(np.concatenate([[0], in_mkt]))
     starts, ends = np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
@@ -151,6 +177,7 @@ def _trade_ledger(
             "holding_bars": ends - starts,
             "holding_time": idx[ends] - idx[starts],
             "crosses_gap": [bool(gap[s:e].any()) for s, e in pairs],
+            "crosses_stale": [bool(stale[s : e + 1].any()) for s, e in pairs],
             "avg_position": [held[s:e].mean() for s, e in pairs],
             "gross_ret": gross,
             "net_ret": net,
@@ -167,6 +194,27 @@ def _daily(idx: pd.DatetimeIndex, log_growth: np.ndarray) -> pd.Series:
     return np.expm1(s.reindex(full, fill_value=0.0))
 
 
+def _executed(
+    df: pd.DataFrame, target: pd.Series | float, max_rt: int | None, min_hold: int
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Executed position per bar (target shifted one bar, constrained, halts deferred)."""
+    held = np.concatenate([[0.0], _validate_target(df, target)[:-1]])
+    held[-1] = 0.0  # no next open after the last bar: liquidate
+    if max_rt is not None or min_hold > 0:
+        held = _apply_constraints(held, df.index.floor("D").asi8, max_rt, min_hold)
+    has_vol = "volume" in df.columns
+    stale = (df["volume"].to_numpy(dtype="float64") <= 0) if has_vol else np.zeros(len(df), dtype=bool)
+    held, deferred = _defer_stale(held, stale)
+    info = {
+        "stale_check": has_vol,
+        "n_stale_bars": int(stale.sum()),
+        "fills_deferred": deferred,
+        "bars_held_across_stale": int((stale & (held > 0)).sum()),
+        "forced_exit_on_stale": bool(stale[-1] and held[-2] > 0),
+    }
+    return held, stale, info
+
+
 def run_backtest(
     df: pd.DataFrame,
     target: pd.Series | float,
@@ -178,14 +226,11 @@ def run_backtest(
     """Simulate ``target`` (decided at each bar's close) on ``df``'s ``open`` prices."""
     if len(df) < 2:
         raise ValueError("need at least two bars")
+    _check_index(df.index)
     assert_pre_holdout(df.index, "run_backtest data")
     idx = df.index
     opens = df["open"].to_numpy(dtype="float64")
-    held = np.concatenate([[0.0], _validate_target(df, target)[:-1]])
-    held[-1] = 0.0  # no next open after the last bar: liquidate
-    if max_round_trips_per_day is not None or min_hold_bars > 0:
-        day = idx.floor("D").asi8
-        held = _apply_constraints(held, day, max_round_trips_per_day, min_hold_bars)
+    held, stale, stale_info = _executed(df, target, max_round_trips_per_day, min_hold_bars)
     weight, gross, cost = bar_pnl(held, opens, cost_bps_per_side / 1e4)
     span, bar_len = _spans(idx, bar)
     ret = np.zeros(len(df))
@@ -211,10 +256,11 @@ def run_backtest(
         "bar": str(bar_len),
         "n_gaps": int(gap.sum()),
         "bars_held_across_gap": int((gap & (held > 0)).sum()),
+        **stale_info,
     }
     return BacktestResult(
         bars=bars,
-        trades=_trade_ledger(idx, opens, held, lg, ln, {"cost": cost, "span": span}),
+        trades=_trade_ledger(idx, opens, held, lg, ln, {"cost": cost, "span": span, "stale": stale}),
         daily=_daily(idx, ln),
         daily_gross=_daily(idx, lg),
         cost_bps_per_side=cost_bps_per_side,
