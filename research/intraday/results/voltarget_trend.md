@@ -1,0 +1,269 @@
+# Vol-targeted trend (family `voltarget_trend`, kind `model`)
+
+Script: `experiments/intraday/voltarget_trend.py`. Long/flat spot, BTCUSDT and ETHUSDT, walk-forward
+OOS window [2020-01-01, 2026-07-01), every config logged at 5 and 10 bps/side with seed 0 (the rules
+are deterministic; the one fitted config, `wf_4h_select`, has no randomness either). Bars: 5m cache
+resampled with `incomplete="drop"` (drops 28 / 48 incomplete 1h / 4h bars over 2017-09..2026-06;
+windows count bars, so a window spanning a dropped bar reaches one bar further back in time).
+
+## Pre-registration (written 2026-11-05 before any OOS run)
+
+24 configs per symbol, 48 runs in total (x2 costs). No config will be added after seeing OOS
+results unless it is logged and marked `post_hoc` below.
+
+### The rule (identical for every config; only the parameters in the grid change)
+
+All windows are given in days and converted to bars of the timeframe (1h: 24 bars/day, 4h: 6).
+Everything at bar t uses bars <= t only.
+
+1. **Forecast vol.** `sig_t` = sqrt(EWMA of squared 1-bar log close returns), half-life `H` days,
+   min periods 2H bars; annualised `vol_t = sig_t * sqrt(bars per year)`.
+2. **Trend score in [0, 1]** = mean over the lookbacks L of one per-lookback signal on the
+   L-bar log close return `r_L`:
+   * `vote`: 1 if `r_L > 0` else 0 (score = fraction of lookbacks that are up);
+   * `z`: `clip(r_L / (sig_t * sqrt(L)), 0, 1)` (a 1-sigma up-move over L is full weight).
+3. **Vol scale** = `min(1, sigma_target / vol_t)`; `none` = no scaling (scale 1).
+4. **Regime filter** (optional): raw exposure is 0 while close <= EMA(R days).
+5. **Raw exposure** = score x scale x regime, in [0, 1].
+6. **Hysteresis.** The target moves to `round(raw / 0.05) * 0.05` only when `|raw - target| > band`;
+   a raw that rounds to 0 always exits to flat at once (no lingering crumbs); a NaN raw (warm-up,
+   `vol_t == 0`) keeps the current target. Targets are therefore multiples of 0.05.
+
+Lookback sets: `mix5` = 1, 3, 7, 14, 30 days; `slow4` = 7, 14, 30, 60 days.
+Defaults unless a row says otherwise: band 0.2, H = 3 days, no regime filter.
+
+### Grid
+
+Block A, full factorial (16): timeframe {1h, 4h} x lookbacks {mix5, slow4} x signal {vote, z} x
+sigma_target {0.30, 0.50}.
+
+| # | name | tf | lookbacks | signal | sigma | other |
+|---|---|---|---|---|---|---|
+| 1 | vt_1h_mix5_vote_s30 | 1h | mix5 | vote | 0.30 | |
+| 2 | vt_1h_mix5_vote_s50 | 1h | mix5 | vote | 0.50 | |
+| 3 | vt_1h_mix5_z_s30 | 1h | mix5 | z | 0.30 | |
+| 4 | vt_1h_mix5_z_s50 | 1h | mix5 | z | 0.50 | |
+| 5 | vt_1h_slow4_vote_s30 | 1h | slow4 | vote | 0.30 | |
+| 6 | vt_1h_slow4_vote_s50 | 1h | slow4 | vote | 0.50 | |
+| 7 | vt_1h_slow4_z_s30 | 1h | slow4 | z | 0.30 | |
+| 8 | vt_1h_slow4_z_s50 | 1h | slow4 | z | 0.50 | |
+| 9 | vt_4h_mix5_vote_s30 | 4h | mix5 | vote | 0.30 | **anchor** for block B |
+| 10 | vt_4h_mix5_vote_s50 | 4h | mix5 | vote | 0.50 | |
+| 11 | vt_4h_mix5_z_s30 | 4h | mix5 | z | 0.30 | |
+| 12 | vt_4h_mix5_z_s50 | 4h | mix5 | z | 0.50 | |
+| 13 | vt_4h_slow4_vote_s30 | 4h | slow4 | vote | 0.30 | |
+| 14 | vt_4h_slow4_vote_s50 | 4h | slow4 | vote | 0.50 | |
+| 15 | vt_4h_slow4_z_s30 | 4h | slow4 | z | 0.30 | |
+| 16 | vt_4h_slow4_z_s50 | 4h | slow4 | z | 0.50 | |
+
+Block B, one-factor ablations of the anchor (8):
+
+| # | name | change vs anchor (4h, mix5, vote, sigma 0.30, band 0.2, H 3d, no regime) |
+|---|---|---|
+| 17 | vt_4h_mix5_vote_s30_b10 | band 0.10 |
+| 18 | vt_4h_mix5_vote_s30_b35 | band 0.35 |
+| 19 | vt_4h_mix5_vote_s30_hl1 | vol half-life 1 day |
+| 20 | vt_4h_mix5_vote_s30_hl10 | vol half-life 10 days |
+| 21 | vt_4h_mix5_vote_s30_reg30 | regime filter EMA 30 days |
+| 22 | vt_4h_mix5_vote_s30_reg90 | regime filter EMA 90 days |
+| 23 | vt_4h_mix5_vote_novol | no vol scaling (exposure = trend score), band 0.2 |
+| 24 | wf_4h_select | walk-forward selection among the 8 block-A 4h configs (#9-16), see below |
+
+`wf_4h_select`: `splits.walk_forward_splits` with quarterly test blocks (`test_months=3`), expanding
+training from 2017-09, purged by `t1` of `labels.forward_return(df, 1)`. Inside each fold,
+`splits.purged_tail_split(train rows, valid_frac=0.5, within=fold)` gives the recent half of the
+training window; the config with the highest mean/std of per-bar net returns at 5 bps on those
+validation rows is used for the whole test quarter. Per-bar net returns come from one full-history
+backtest per config; the P&L of row t is known by `t1` (open of bar t+2), so nothing from the test
+block enters the choice. Quarterly (not monthly) refit keeps the switching cost and the selection
+noise down.
+
+No other tuning. Rules 1-23 have no fitted state; signals are computed over the full 2017-09..
+history so the windows are warm at 2020-01-01, sliced to the OOS window and backtested once.
+Benchmarks (buy-and-hold, vol-matched buy-and-hold) are shown for context and NOT logged.
+
+<!-- RESULTS:BEGIN -->
+## Results (OOS 2020-01-01..2026-06-30, generated by the script, n_trials in registry after this run = 96)
+
+Every run, sorted by base-cost Sharpe (cost drag = sum of per-fill costs as a fraction of equity):
+
+| config | tf | sym | Sharpe @5 | Sharpe @10 | CAGR @5 | MaxDD @5 | trades | trades/day | net bps/trade @5 / @10 | PF @5 | +months | worst year @5 | exposure | fills | cost drag @5 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| vt_1h_slow4_z_s30 | 1h | BTC | 1.51 | 1.48 | 28.9% | -16.9% | 53 | 0.02 | 386.4 / 378.3 | 8.53 | 44% | -9.7% | 23% | 371 | 3.9% |
+| vt_1h_mix5_z_s30 | 1h | BTC | 1.48 | 1.38 | 24.9% | -19.0% | 160 | 0.07 | 106.4 / 99.8 | 3.43 | 47% | -12.7% | 21% | 911 | 9.9% |
+| vt_4h_mix5_vote_s30_reg30 | 4h | ETH | 1.42 | 1.34 | 32.5% | -18.4% | 187 | 0.08 | 111.8 / 105.6 | 2.93 | 46% | -1.8% | 19% | 714 | 11.2% |
+| vt_1h_mix5_z_s50 | 1h | ETH | 1.42 | 1.33 | 39.9% | -28.0% | 198 | 0.08 | 131.3 / 123.7 | 3.15 | 44% | -14.9% | 26% | 1259 | 14.0% |
+| vt_4h_slow4_z_s30 | 4h | BTC | 1.40 | 1.37 | 27.2% | -16.6% | 45 | 0.02 | 446.1 / 436.7 | 8.11 | 41% | -10.1% | 24% | 339 | 3.8% |
+| vt_4h_mix5_z_s30 | 4h | BTC | 1.40 | 1.31 | 24.0% | -19.4% | 128 | 0.05 | 131.6 / 124.1 | 3.44 | 47% | -13.1% | 21% | 751 | 8.9% |
+| wf_4h_select | 4h | ETH | 1.40 | 1.34 | 41.1% | -32.1% | 149 | 0.06 | 197.7 / 189.4 | 3.54 | 42% | -13.5% | 24% | 815 | 10.5% |
+| vt_1h_slow4_vote_s30 | 1h | ETH | 1.39 | 1.33 | 38.3% | -21.4% | 141 | 0.06 | 194.9 / 187.1 | 5.42 | 50% | -3.2% | 26% | 758 | 9.7% |
+| vt_1h_slow4_z_s30 | 1h | ETH | 1.39 | 1.37 | 28.9% | -14.8% | 45 | 0.02 | 436.0 / 430.7 | 7.65 | 45% | -3.9% | 17% | 219 | 2.2% |
+| vt_1h_slow4_z_s50 | 1h | BTC | 1.37 | 1.33 | 35.4% | -25.4% | 67 | 0.03 | 416.7 / 405.5 | 7.24 | 44% | -14.5% | 33% | 582 | 6.2% |
+| vt_4h_mix5_z_s30 | 4h | ETH | 1.36 | 1.31 | 25.7% | -17.8% | 112 | 0.05 | 148.7 / 143.4 | 3.44 | 42% | -8.5% | 16% | 498 | 5.6% |
+| vt_4h_slow4_z_s30 | 4h | ETH | 1.33 | 1.31 | 26.2% | -15.9% | 45 | 0.02 | 391.6 / 386.0 | 6.58 | 42% | -3.6% | 17% | 223 | 2.3% |
+| vt_1h_slow4_vote_s50 | 1h | ETH | 1.31 | 1.20 | 51.5% | -30.3% | 254 | 0.11 | 162.0 / 148.5 | 4.82 | 50% | -11.1% | 40% | 2156 | 27.8% |
+| vt_1h_mix5_z_s30 | 1h | ETH | 1.31 | 1.25 | 23.4% | -17.2% | 127 | 0.05 | 118.3 / 113.2 | 3.39 | 47% | -9.4% | 15% | 591 | 6.1% |
+| vt_4h_mix5_vote_s30_reg30 | 4h | BTC | 1.30 | 1.16 | 27.2% | -18.4% | 193 | 0.08 | 94.7 / 85.2 | 2.83 | 50% | -5.3% | 26% | 980 | 17.3% |
+| vt_4h_mix5_vote_s30_b35 | 4h | BTC | 1.28 | 1.20 | 28.8% | -22.1% | 133 | 0.06 | 159.3 / 150.1 | 3.16 | 49% | -17.4% | 32% | 558 | 11.3% |
+| vt_1h_mix5_vote_s50 | 1h | ETH | 1.27 | 1.11 | 45.9% | -36.8% | 346 | 0.15 | 90.4 / 79.4 | 2.53 | 44% | -16.6% | 39% | 2291 | 34.8% |
+| wf_4h_select | 4h | BTC | 1.27 | 1.21 | 23.4% | -17.6% | 87 | 0.04 | 188.5 / 180.4 | 4.38 | 46% | -11.2% | 24% | 562 | 6.6% |
+| vt_1h_slow4_z_s50 | 1h | ETH | 1.26 | 1.23 | 38.2% | -24.0% | 69 | 0.03 | 402.8 / 392.8 | 6.27 | 45% | -10.2% | 28% | 542 | 5.7% |
+| vt_4h_slow4_vote_s50 | 4h | ETH | 1.25 | 1.18 | 47.1% | -30.3% | 142 | 0.06 | 254.2 / 240.2 | 4.93 | 47% | -9.1% | 40% | 1213 | 16.2% |
+| vt_4h_slow4_vote_s30 | 4h | ETH | 1.23 | 1.19 | 32.0% | -20.6% | 93 | 0.04 | 242.0 / 233.9 | 4.91 | 44% | -5.4% | 26% | 514 | 6.7% |
+| vt_4h_slow4_z_s50 | 4h | ETH | 1.22 | 1.20 | 36.7% | -20.6% | 63 | 0.03 | 423.2 / 413.1 | 6.37 | 46% | -6.5% | 28% | 470 | 5.3% |
+| vt_4h_mix5_vote_s30_hl10 | 4h | ETH | 1.21 | 1.14 | 27.4% | -24.0% | 171 | 0.07 | 110.2 / 104.2 | 2.63 | 45% | -13.7% | 23% | 750 | 9.8% |
+| vt_1h_mix5_vote_s30 | 1h | ETH | 1.20 | 1.09 | 27.9% | -28.4% | 260 | 0.11 | 71.9 / 65.2 | 2.46 | 47% | -8.1% | 24% | 1249 | 16.5% |
+| vt_4h_mix5_vote_s30 | 4h | ETH | 1.20 | 1.11 | 28.1% | -25.3% | 179 | 0.08 | 107.8 / 100.5 | 2.65 | 47% | -12.4% | 25% | 908 | 12.1% |
+| vt_4h_slow4_z_s50 | 4h | BTC | 1.19 | 1.15 | 30.5% | -27.5% | 59 | 0.02 | 422.3 / 410.0 | 6.09 | 42% | -14.2% | 33% | 511 | 6.0% |
+| vt_4h_mix5_vote_novol | 4h | ETH | 1.18 | 1.08 | 57.4% | -44.8% | 255 | 0.11 | 172.6 / 157.8 | 2.68 | 47% | -18.2% | 50% | 1736 | 31.5% |
+| vt_4h_slow4_vote_s30 | 4h | BTC | 1.18 | 1.11 | 27.1% | -26.1% | 120 | 0.05 | 174.7 / 164.3 | 4.01 | 49% | -19.1% | 35% | 824 | 10.8% |
+| vt_4h_mix5_z_s50 | 4h | ETH | 1.18 | 1.10 | 31.7% | -27.7% | 161 | 0.07 | 131.7 / 123.2 | 2.84 | 42% | -13.0% | 25% | 1055 | 12.7% |
+| vt_4h_mix5_z_s50 | 4h | BTC | 1.18 | 1.07 | 27.3% | -36.9% | 184 | 0.08 | 112.3 / 102.9 | 2.69 | 42% | -27.6% | 30% | 1268 | 15.9% |
+| vt_1h_mix5_z_s50 | 1h | BTC | 1.17 | 1.05 | 27.2% | -30.0% | 227 | 0.10 | 86.6 / 77.5 | 2.78 | 47% | -20.9% | 30% | 1681 | 18.9% |
+| vt_4h_mix5_vote_s30_reg90 | 4h | ETH | 1.16 | 1.09 | 23.7% | -20.6% | 137 | 0.06 | 119.9 / 112.5 | 2.93 | 40% | -10.6% | 18% | 648 | 9.6% |
+| vt_1h_slow4_vote_s50 | 1h | BTC | 1.16 | 0.97 | 36.8% | -43.3% | 380 | 0.16 | 84.9 / 72.8 | 3.68 | 41% | -33.1% | 48% | 3028 | 38.7% |
+| vt_4h_mix5_vote_s30_b10 | 4h | ETH | 1.16 | 0.99 | 26.0% | -25.5% | 329 | 0.14 | 55.4 / 47.9 | 2.37 | 46% | -10.8% | 26% | 2814 | 23.2% |
+| vt_1h_slow4_vote_s30 | 1h | BTC | 1.14 | 1.03 | 25.6% | -30.5% | 186 | 0.08 | 107.4 / 97.6 | 3.74 | 42% | -23.7% | 34% | 1276 | 16.3% |
+| vt_1h_mix5_vote_s50 | 1h | BTC | 1.14 | 0.92 | 34.7% | -38.3% | 372 | 0.16 | 77.1 / 64.3 | 2.58 | 46% | -28.3% | 45% | 2621 | 41.9% |
+| vt_4h_mix5_vote_s50 | 4h | ETH | 1.13 | 1.02 | 39.5% | -40.6% | 234 | 0.10 | 127.7 / 116.1 | 2.51 | 45% | -18.2% | 39% | 1571 | 24.4% |
+| vt_1h_mix5_vote_s30 | 1h | BTC | 1.12 | 0.93 | 23.9% | -32.6% | 310 | 0.13 | 60.2 / 51.1 | 2.47 | 46% | -22.5% | 33% | 1853 | 26.1% |
+| vt_4h_mix5_vote_s30_b35 | 4h | ETH | 1.11 | 1.07 | 27.2% | -25.5% | 101 | 0.04 | 181.0 / 174.6 | 2.81 | 44% | -10.5% | 23% | 320 | 6.2% |
+| vt_4h_mix5_vote_s30_hl10 | 4h | BTC | 1.08 | 0.96 | 22.5% | -31.6% | 228 | 0.10 | 81.2 / 73.7 | 2.44 | 46% | -24.0% | 32% | 1129 | 16.0% |
+| vt_4h_mix5_vote_s30_reg90 | 4h | BTC | 1.08 | 0.96 | 21.0% | -19.6% | 156 | 0.07 | 103.6 / 93.2 | 2.82 | 38% | -6.5% | 25% | 929 | 15.1% |
+| vt_4h_slow4_vote_s50 | 4h | BTC | 1.08 | 0.98 | 33.8% | -43.9% | 206 | 0.09 | 144.0 / 131.9 | 3.54 | 45% | -29.6% | 48% | 1568 | 20.7% |
+| vt_4h_mix5_vote_s30_hl1 | 4h | ETH | 1.08 | 0.97 | 25.4% | -27.0% | 192 | 0.08 | 93.9 / 84.4 | 2.37 | 47% | -7.5% | 27% | 1245 | 17.0% |
+| vt_4h_mix5_vote_novol | 4h | BTC | 1.02 | 0.88 | 34.7% | -45.6% | 269 | 0.11 | 130.6 / 116.1 | 2.57 | 44% | -29.3% | 52% | 1765 | 32.1% |
+| vt_4h_mix5_vote_s30 | 4h | BTC | 1.01 | 0.88 | 21.3% | -29.3% | 228 | 0.10 | 73.8 / 64.8 | 2.24 | 46% | -20.1% | 33% | 1317 | 19.1% |
+| vt_4h_mix5_vote_s30_b10 | 4h | BTC | 1.01 | 0.77 | 21.6% | -32.7% | 386 | 0.16 | 45.1 / 35.4 | 2.22 | 49% | -24.0% | 35% | 3780 | 34.4% |
+| vt_4h_mix5_vote_s30_hl1 | 4h | BTC | 1.00 | 0.83 | 21.8% | -27.2% | 234 | 0.10 | 73.4 / 62.0 | 2.23 | 49% | -20.5% | 35% | 1667 | 24.3% |
+| vt_4h_mix5_vote_s50 | 4h | BTC | 0.94 | 0.79 | 26.4% | -45.5% | 258 | 0.11 | 97.5 / 84.7 | 2.33 | 44% | -32.2% | 46% | 1760 | 29.1% |
+
+Both symbols side by side, sorted by the weaker symbol:
+
+| config | BTC Sharpe @5 / @10 | ETH Sharpe @5 / @10 | BTC MaxDD | ETH MaxDD | min Sharpe @5 |
+|---|---|---|---|---|---|
+| vt_1h_slow4_z_s30 | 1.51 / 1.48 | 1.39 / 1.37 | -16.9% | -14.8% | 1.39 |
+| vt_4h_mix5_z_s30 | 1.40 / 1.31 | 1.36 / 1.31 | -19.4% | -17.8% | 1.36 |
+| vt_4h_slow4_z_s30 | 1.40 / 1.37 | 1.33 / 1.31 | -16.6% | -15.9% | 1.33 |
+| vt_1h_mix5_z_s30 | 1.48 / 1.38 | 1.31 / 1.25 | -19.0% | -17.2% | 1.31 |
+| vt_4h_mix5_vote_s30_reg30 | 1.30 / 1.16 | 1.42 / 1.34 | -18.4% | -18.4% | 1.30 |
+| wf_4h_select | 1.27 / 1.21 | 1.40 / 1.34 | -17.6% | -32.1% | 1.27 |
+| vt_1h_slow4_z_s50 | 1.37 / 1.33 | 1.26 / 1.23 | -25.4% | -24.0% | 1.26 |
+| vt_4h_slow4_z_s50 | 1.19 / 1.15 | 1.22 / 1.20 | -27.5% | -20.6% | 1.19 |
+| vt_4h_slow4_vote_s30 | 1.18 / 1.11 | 1.23 / 1.19 | -26.1% | -20.6% | 1.18 |
+| vt_4h_mix5_z_s50 | 1.18 / 1.07 | 1.18 / 1.10 | -36.9% | -27.7% | 1.18 |
+| vt_1h_mix5_z_s50 | 1.17 / 1.05 | 1.42 / 1.33 | -30.0% | -28.0% | 1.17 |
+| vt_1h_slow4_vote_s50 | 1.16 / 0.97 | 1.31 / 1.20 | -43.3% | -30.3% | 1.16 |
+| vt_1h_slow4_vote_s30 | 1.14 / 1.03 | 1.39 / 1.33 | -30.5% | -21.4% | 1.14 |
+| vt_1h_mix5_vote_s50 | 1.14 / 0.92 | 1.27 / 1.11 | -38.3% | -36.8% | 1.14 |
+| vt_1h_mix5_vote_s30 | 1.12 / 0.93 | 1.20 / 1.09 | -32.6% | -28.4% | 1.12 |
+| vt_4h_mix5_vote_s30_b35 | 1.28 / 1.20 | 1.11 / 1.07 | -22.1% | -25.5% | 1.11 |
+| vt_4h_mix5_vote_s30_hl10 | 1.08 / 0.96 | 1.21 / 1.14 | -31.6% | -24.0% | 1.08 |
+| vt_4h_mix5_vote_s30_reg90 | 1.08 / 0.96 | 1.16 / 1.09 | -19.6% | -20.6% | 1.08 |
+| vt_4h_slow4_vote_s50 | 1.08 / 0.98 | 1.25 / 1.18 | -43.9% | -30.3% | 1.08 |
+| vt_4h_mix5_vote_novol | 1.02 / 0.88 | 1.18 / 1.08 | -45.6% | -44.8% | 1.02 |
+| vt_4h_mix5_vote_s30 | 1.01 / 0.88 | 1.20 / 1.11 | -29.3% | -25.3% | 1.01 |
+| vt_4h_mix5_vote_s30_b10 | 1.01 / 0.77 | 1.16 / 0.99 | -32.7% | -25.5% | 1.01 |
+| vt_4h_mix5_vote_s30_hl1 | 1.00 / 0.83 | 1.08 / 0.97 | -27.2% | -27.0% | 1.00 |
+| vt_4h_mix5_vote_s50 | 0.94 / 0.79 | 1.13 / 1.02 | -45.5% | -40.6% | 0.94 |
+
+Calendar-year net returns @5 bps (top 4 by min Sharpe, plus the anchor and the no-vol ablation):
+
+| config | sym | 2020 | 2021 | 2022 | 2023 | 2024 | 2025 | 2026 |
+|---|---|---|---|---|---|---|---|---|
+| vt_1h_slow4_z_s30 | BTC | +91.4% | +36.2% | -9.7% | +59.5% | +34.0% | +5.6% | -2.0% |
+| vt_1h_slow4_z_s30 | ETH | +84.3% | +66.8% | -2.1% | +22.4% | +15.8% | +26.9% | -3.9% |
+| vt_4h_mix5_z_s30 | BTC | +90.3% | +19.7% | -13.1% | +49.0% | +45.4% | -1.3% | -4.4% |
+| vt_4h_mix5_z_s30 | ETH | +85.7% | +33.3% | +4.3% | +32.4% | +17.6% | +20.2% | -8.5% |
+| vt_4h_slow4_z_s30 | BTC | +89.5% | +38.6% | -10.1% | +52.8% | +37.5% | -1.3% | -2.3% |
+| vt_4h_slow4_z_s30 | ETH | +71.6% | +53.0% | -2.3% | +31.4% | +9.3% | +28.0% | -3.6% |
+| vt_1h_mix5_z_s30 | BTC | +108.7% | +17.2% | -12.7% | +49.3% | +38.2% | +0.9% | -4.3% |
+| vt_1h_mix5_z_s30 | ETH | +72.3% | +35.8% | +2.6% | +28.3% | +17.5% | +19.7% | -9.4% |
+| vt_4h_mix5_vote_s30 | BTC | +119.6% | +15.0% | -20.1% | +54.1% | +30.8% | -8.7% | -5.3% |
+| vt_4h_mix5_vote_s30 | ETH | +102.8% | +55.7% | -12.4% | +31.5% | +20.1% | +24.7% | -8.3% |
+| vt_4h_mix5_vote_novol | BTC | +249.1% | +39.5% | -29.3% | +73.3% | +53.0% | -14.0% | -11.5% |
+| vt_4h_mix5_vote_novol | ETH | +366.9% | +180.7% | +0.2% | +23.3% | +46.9% | -2.0% | -18.2% |
+
+Benchmarks (context, not logged):
+
+* buy-and-hold 4h BTC @5: Sharpe 0.84, CAGR 38.0%, MaxDD -76.6%, worst year -64.2%, +months 55%
+* buy-and-hold 4h ETH @5: Sharpe 0.89, CAGR 46.8%, MaxDD -79.3%, worst year -67.5%, +months 54%
+* buy-and-hold 1h BTC @5: Sharpe 0.84, CAGR 38.1%, MaxDD -76.6%, worst year -64.2%, +months 55%
+* buy-and-hold 1h ETH @5: Sharpe 0.89, CAGR 46.8%, MaxDD -79.3%, worst year -67.5%, +months 54%
+
+`wf_4h_select` choices:
+
+* BTC picks per quarter: 2020-01-01: slow4_vote_s30, 2020-04-01: slow4_vote_s30, 2020-07-01: slow4_vote_s30, 2020-10-01: mix5_z_s30, 2021-01-01: mix5_z_s30, 2021-04-01: mix5_z_s30, 2021-07-01: slow4_z_s30, 2021-10-01: slow4_z_s30, 2022-01-01: mix5_z_s30, 2022-04-01: slow4_z_s30, 2022-07-01: slow4_z_s30, 2022-10-01: slow4_z_s30, 2023-01-01: slow4_z_s30, 2023-04-01: slow4_z_s30, 2023-07-01: slow4_z_s30, 2023-10-01: slow4_z_s30, 2024-01-01: slow4_z_s30, 2024-04-01: slow4_z_s30, 2024-07-01: slow4_z_s30, 2024-10-01: mix5_z_s30, 2025-01-01: mix5_z_s30, 2025-04-01: mix5_z_s30, 2025-07-01: mix5_z_s30, 2025-10-01: mix5_z_s30, 2026-01-01: mix5_z_s30, 2026-04-01: mix5_z_s30
+  (counts: vt_4h_slow4_z_s30: 12, vt_4h_mix5_z_s30: 11, vt_4h_slow4_vote_s30: 3)
+* ETH picks per quarter: 2020-01-01: mix5_vote_s50, 2020-04-01: mix5_vote_s50, 2020-07-01: mix5_vote_s50, 2020-10-01: mix5_vote_s50, 2021-01-01: mix5_vote_s50, 2021-04-01: mix5_vote_s50, 2021-07-01: mix5_vote_s50, 2021-10-01: mix5_vote_s50, 2022-01-01: mix5_vote_s50, 2022-04-01: mix5_vote_s50, 2022-07-01: mix5_vote_s50, 2022-10-01: slow4_z_s30, 2023-01-01: mix5_z_s30, 2023-04-01: mix5_z_s30, 2023-07-01: mix5_z_s30, 2023-10-01: slow4_z_s30, 2024-01-01: mix5_z_s30, 2024-04-01: slow4_z_s30, 2024-07-01: slow4_z_s30, 2024-10-01: mix5_z_s30, 2025-01-01: mix5_z_s30, 2025-04-01: mix5_z_s30, 2025-07-01: mix5_z_s30, 2025-10-01: mix5_z_s30, 2026-01-01: mix5_z_s30, 2026-04-01: mix5_z_s30
+  (counts: vt_4h_mix5_vote_s50: 11, vt_4h_mix5_z_s30: 11, vt_4h_slow4_z_s30: 4)
+<!-- RESULTS:END -->
+
+## Reading the table
+
+Run once on 2026-11-05 (git `d8d62b9`, script untracked); 96 registry lines = 24 configs x 2 symbols
+x 2 costs, 48 distinct runs (registry N = 96 with the 48 baselines). No post-hoc configs. Before the
+OOS run the script was smoke-run on 2018-07..2019 (training data only, nothing logged); that pass did
+not change the grid. After the OOS run the script got lint-only edits (ruff format, `0.10` -> `0.1`);
+`build_candidate("vt_4h_mix5_vote_s30_b10")` still reproduces the logged returns hash at both costs.
+
+**Does it beat the best baseline and buy-and-hold?** Buy-and-hold: yes, everywhere. All 48 runs beat
+buy-and-hold (0.84 / 0.89) at 5 bps, and the s30 rows do it with max drawdowns of -15% to -33% against
+-77% / -79%. The best baseline: only partly. The best config, `vt_1h_slow4_z_s30` (1h, lookbacks
+7/14/30/60 days, z signal, sigma 0.30), scores **BTC 1.51 / 1.48, ETH 1.39 / 1.37** (5 / 10 bps). That beats
+the BTC baseline bar (1.348) but not the ETH bar (1.467, `tsmom_4h_180`). No config clears both bars;
+the closest on ETH are `vt_1h_mix5_z_s50` and `vt_4h_mix5_vote_s30_reg30` (1.42 each, but BTC 1.17 / 1.30).
+On Sharpe alone this is a tie with the 30-day trend rules within noise (daily t-stats 3.5-3.9). The real
+difference is the **risk profile**. Max drawdown is -17% / -15% against -38% / -39% for `ema_px_4h_180`,
+the worst year is -9.7% / -3.9% against -12.4% / -11.1%, and the 2020-excluded Sharpe is 1.18 / 1.11
+against 1.00 / 1.18. The price is a CAGR of 29% against 59% / 84%: average weight is 0.28-0.36 when long.
+`promotion.evaluate(build_candidate("vt_1h_slow4_z_s30"))` is **FAIL**. It passes Sharpe @5/@10, t-stat
+(3.9 / 3.5), PF, MaxDD, worst year, best-month share, permutation p (0.004), and beats buy-and-hold and
+vol-matched buy-and-hold. It fails OOS trades (53 / 45, needs 500), positive months (44% / 45%, needs
+60%), DSR (about 0 at N = 96), the ETH baseline (-0.08) and ETH PBO (0.27, needs <= 0.20).
+
+**Where the edge comes from.** It is the slow trend premium that the baselines already found. Vol
+targeting does not add it; it reshapes it. The ablations around the anchor (`vt_4h_mix5_vote_s30`,
+1.01 / 1.20) show this:
+(a) **Vol scaling cuts risk, not Sharpe.** With no vol scaling, `_novol` scores 1.02 / 1.18 but its max
+drawdown is -46% / -45% against -29% / -25%, and its 2022 is -29% against -20% (BTC).
+(b) **The `z` signal adds most of the Sharpe.** It moves the anchor to 1.40 / 1.36 at the same sigma, and
+the 1h/4h x mix5/slow4 combinations all land at 1.31-1.51. It is the only factor that moves both
+symbols up together. It needs an up-move of about 1 sigma over the lookback before it goes fully long,
+so it stays out of drift-less chop. Exposure falls to 15-24%, and the fills that remain are
+large-conviction moves (PF 3.4-8.5).
+(c) **sigma 0.30 beats 0.50 on Sharpe in 6 of 8 BTC pairs and 5 of 8 ETH pairs.** At 0.50 the cap of 1
+binds less often, so the book holds through high-vol drawdowns (MaxDD -25% to -46%).
+(d) **The regime filter helps the `vote` signal.** EMA 30d gives 1.30 / 1.42 and -18% max drawdown on
+both symbols. EMA 90d gives 1.08 / 1.16; it is too slow to add anything.
+(e) **Vol half-life barely matters** (1d / 3d / 10d give 1.00-1.08 BTC and 1.08-1.21 ETH).
+(f) **Walk-forward selection did not help.** `wf_4h_select` (1.27 / 1.40) is below the best fixed 4h
+config on both symbols. On ETH it chose `mix5_vote_s50` for 2020-2022 because that config looked best
+in the 2018-2019 training tail, and that choice is the -32% ETH max drawdown. In-sample choice among
+these configs is noisy, which agrees with the ETH PBO of 0.27.
+
+**Sensitivity to cost.** Low for the `z` / slow configs, real for the fast ones. Going from 5 to 10
+bps costs 0.02-0.04 Sharpe on the slow4/z rows (cost drag 2-6% of equity over 6.5 years) and 0.06-0.22
+on the 1h `vote` rows (e.g. `vt_1h_mix5_vote_s50` BTC 1.14 -> 0.92). The rebalance band is the turnover
+lever. Band 0.10 gives 3,780 BTC fills, and Sharpe at 10 bps drops to 0.77. Band 0.35 gives 558 fills
+and is the best BTC `vote` row without a regime filter (1.28 / 1.20). It is worse on ETH (1.11).
+**Timeframe.** 1h and 4h are close once the signal is slow: slow4/z/s30 is 1.51 / 1.39 at 1h and
+1.40 / 1.33 at 4h. At 1h the EWMA vol and the z-score are less noisy, but the book pays for more
+small rebalances. A 1h-vs-4h gap of about 0.1 is within noise, and nothing here argues for going to 15m.
+
+**Is any year a disaster?** No, for the s30 `z` configs. Their worst year is -13.1% (BTC 2022,
+`vt_4h_mix5_z_s30`) and -9.7% for the best config, against -64% / -67% for buy-and-hold in 2022. The `vote`
+anchor lost 20% in BTC 2022 and `_novol` lost 29%. But the P&L is front-loaded. 2020 is +72% to +120%
+for every top config. Excluding 2020, Sharpe falls to 0.98-1.18, and from 2022 on to 0.82-1.06 (the
+30-day baselines give 0.74-0.94 on the same 2022+ window). BTC 2025 (-1% to +6%) and H1 2026 (-2% to
+-9% on both symbols) are flat to slightly negative for every top config. That is the same recent
+weakness the baselines show, so this family does not solve it. Positive months are 38-50% for every
+config. This is a trend book whose returns come from a few large months; it cannot meet the 60%
+positive-months rule, and as a mostly-long book that rarely goes fully flat it cannot meet the
+500-trade rule either. Both rules are structural misses for this family, not tuning misses.
+
+Caveats: the grid (lookbacks, sigma levels, bands) is the author's prior, not fitted. 48 runs are in
+the DSR N. The DSR row reads about 0 because the registry-wide variance of trial Sharpes, about 1.28
+annualised, is dominated by the -2.5 to -4.5 time-of-day baselines. That sets the expected-max
+benchmark near 3.2 annual Sharpe at N = 96, so no plausible candidate can pass; see `harness_issues`
+in the orchestrator report. The holdout was not opened.
