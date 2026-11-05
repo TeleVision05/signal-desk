@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -140,10 +141,26 @@ class Store:
         self.conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-        self.conn.execute("PRAGMA journal_mode=WAL")
+        self._enable_wal()
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.migrate()
+
+    def _enable_wal(self) -> None:
+        """Switch to WAL, retrying while another process holds the lock.
+
+        SQLite does not apply busy_timeout to the journal-mode switch, so the dashboard and the
+        runner, started together by install, could crash with 'database is locked' on a new file.
+        """
+        deadline = time.monotonic() + BUSY_TIMEOUT_MS / 1000
+        while True:
+            try:
+                self.conn.execute("PRAGMA journal_mode=WAL")
+                return
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc) or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
 
     def close(self) -> None:
         self.conn.close()

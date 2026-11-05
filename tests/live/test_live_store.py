@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import random
 import sqlite3
+import threading
+import time
 
 import pytest
 
@@ -79,3 +81,18 @@ def test_backoff_grows_and_caps():
     assert exchange_trouble({"status": "exchange_unreachable"})
     assert exchange_trouble({"status": "degraded", "books": [{"decision": "data_error"}]})
     assert not exchange_trouble({"status": "degraded", "books": [{"decision": "strategy_error"}]})
+
+
+def test_second_process_opening_a_new_db_mid_migration_waits_instead_of_crashing(tmp_path):
+    """The dashboard and runner start together at install; the second must not die on 'locked'."""
+    path = tmp_path / "live.sqlite"
+    other = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+    other.execute("BEGIN IMMEDIATE")
+    other.execute("CREATE TABLE t (x)")  # rollback-journal db, write lock held: a fresh runner migrating
+    threading.Timer(0.5, lambda: other.execute("COMMIT")).start()
+    t0 = time.monotonic()
+    store = Store(path)
+    assert time.monotonic() - t0 >= 0.4
+    assert store.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    store.close()
+    other.close()
