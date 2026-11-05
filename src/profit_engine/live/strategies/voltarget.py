@@ -145,7 +145,7 @@ class VolTargetTrend:
         self.warmup_bars = WARMUP_BARS[config]
         self.other_symbol = None
         self.meta = StrategyMeta(
-            version=f"{config}/1",
+            version="1",  # the config name is in params; the dashboard shows "voltarget_trend v1"
             params={"config": config, **self.params, "warmup_bars": self.warmup_bars},
             status=STATUS,
             family=FAMILY,
