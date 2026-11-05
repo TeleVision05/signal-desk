@@ -112,6 +112,14 @@ class _AlreadyDone(Exception):
     """Internal: roll back a claim that turned out to be stale."""
 
 
+class BookConflict(ValueError):
+    """books.json now gives an existing book a different coin or timeframe than its history."""
+
+    def __init__(self, book_id: str, stored: tuple[str, str], wanted: tuple[str, str]) -> None:
+        super().__init__(f"book {book_id!r} was {stored}, settings now say {wanted}")
+        self.book_id, self.stored, self.wanted = book_id, stored, wanted
+
+
 class Store:
     def __init__(self, path: Path | str) -> None:
         if "://" in str(path):  # before Path(), which would fold "//" into "/"
@@ -159,7 +167,11 @@ class Store:
     # -- books ---------------------------------------------------------------------------
 
     def upsert_book(self, spec, now: pd.Timestamp) -> None:
-        """Create the book on first sight (cash = starting equity); refresh its metadata after."""
+        """Create the book on first sight (cash = starting equity); refresh its metadata after.
+
+        Raises :class:`BookConflict` (and changes nothing) if the book already exists with a
+        different symbol or timeframe: its units, marks and last bar belong to the old market.
+        """
         s, meta = spec.strategy, spec.strategy.meta
         row = {
             "book_id": spec.book_id, "title": spec.title, "symbol": s.symbol, "timeframe": s.timeframe,
@@ -174,6 +186,9 @@ class Store:
                    "promoted", "enabled")  # fmt: skip
         update = ", ".join(f"{k}=excluded.{k}" for k in refresh)
         with self.tx() as c:
+            have = c.execute("SELECT symbol, timeframe FROM books WHERE book_id=?", (spec.book_id,)).fetchone()
+            if have is not None and tuple(have) != (s.symbol, s.timeframe):
+                raise BookConflict(spec.book_id, tuple(have), (s.symbol, s.timeframe))
             c.execute(f"INSERT INTO books ({cols}) VALUES ({marks}) ON CONFLICT(book_id) DO UPDATE SET {update}", row)
 
     def book(self, book_id: str, conn: sqlite3.Connection | None = None) -> dict | None:
@@ -238,16 +253,21 @@ class Store:
 
     # -- marks, kill switch, pause -----------------------------------------------------------
 
-    def record_mark(self, book_id: str, ts: pd.Timestamp, price: float, now: pd.Timestamp) -> dict:
-        """Mark the book at ``price`` (a bar close at ``ts``); the first mark of a UTC day sets
-        that day's starting equity. Returns equity, day-start equity and the book row."""
+    def record_mark(
+        self, book_id: str, ts: pd.Timestamp, price: float, now: pd.Timestamp, midnight_price: float | None = None
+    ) -> dict:
+        """Mark the book at ``price`` (a bar close at ``ts``). On the first mark of a UTC day the
+        day's starting equity is set to the equity at 00:00 UTC (see :meth:`_midnight_equity`),
+        not to this mark, so losses made while the Mac slept still count against the daily limit.
+        Returns equity, day-start equity and the book row."""
         with self.tx() as c:
             book = self.book(book_id, c)
             eq = equity(book["cash"], book["units"], price)
             day = pd.Timestamp(ts).strftime("%Y-%m-%d")
             if book["day"] != day:
-                c.execute("UPDATE books SET day=?, day_start_equity=? WHERE book_id=?", (day, eq, book_id))
-                book["day_start_equity"] = eq
+                start = eq if book["day"] is None else self._midnight_equity(c, book, ts, midnight_price)
+                c.execute("UPDATE books SET day=?, day_start_equity=? WHERE book_id=?", (day, start, book_id))
+                book["day_start_equity"] = start
             c.execute(
                 "INSERT INTO equity_marks (book_id, ts, price, equity, units, cash) VALUES (?,?,?,?,?,?) "
                 "ON CONFLICT(book_id, ts) DO NOTHING",
@@ -255,6 +275,31 @@ class Store:
             )
             c.execute("UPDATE books SET last_mark_ts=?, last_mark_price=? WHERE book_id=?", (iso(ts), price, book_id))
         return {"equity": eq, "day_start_equity": book["day_start_equity"], "book": book}
+
+    @staticmethod
+    def _midnight_equity(c: sqlite3.Connection, book: dict, ts: pd.Timestamp, price: float | None) -> float:
+        """Equity at 00:00 UTC of ``ts``'s day: the position held then, at the 00:00 price.
+
+        The position is the book's current one unless a fill landed at or after midnight, in
+        which case it is the position just before the first such fill. Without a 00:00 price
+        (a data gap), the last mark before midnight stands in for it."""
+        midnight = iso(pd.Timestamp(ts).floor("D"))
+        first = c.execute(
+            "SELECT price, units_delta, units_after, equity_before FROM fills WHERE book_id=? AND fill_bar_ts>=? "
+            "ORDER BY fill_bar_ts, id LIMIT 1",
+            (book["book_id"], midnight),
+        ).fetchone()
+        units, cash = book["units"], book["cash"]
+        if first is not None:
+            units = first["units_after"] - first["units_delta"]
+            cash = first["equity_before"] - units * first["price"]
+        if price is not None:
+            return equity(cash, units, price)
+        last = c.execute(
+            "SELECT equity FROM equity_marks WHERE book_id=? AND ts<=? ORDER BY ts DESC LIMIT 1",
+            (book["book_id"], midnight),
+        ).fetchone()
+        return float(last["equity"]) if last is not None else equity(cash, units, book["last_mark_price"] or 0.0)
 
     def trigger_kill_switch(self, book_id: str, kill: dict) -> CommitResult:
         """Go flat at ``kill['price']`` and pause until ``kill['paused_until']``, at most once

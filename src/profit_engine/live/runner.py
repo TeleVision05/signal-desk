@@ -8,12 +8,22 @@ Per enabled book:
    (``incomplete="drop"``) and take the latest CLOSED decision bar.
 2. Guards: stale feed (latest closed bar more than ``stale_after_bars`` timeframes old) and
    price sanity skip with an event; the fill price must exist (the next bar's open).
+   The history fetched is widened (up to :data:`MAX_WIDEN` doublings) until it holds
+   ``warmup_bars`` complete bars, so a Binance data gap never stops a warmed-up book from
+   deciding; if it still cannot, a ``warming_up`` event says so. A fill that would land on a
+   halted 5m bar (``volume == 0``: Binance prints a stale open) is not taken; like the
+   harness, the book waits for the next bar with trading (``halted`` event).
 3. Decide on the latest closed bar ONLY. Bars missed while the Mac slept are counted in a
    ``catch_up`` event, never replayed. Fill at the NEXT bar's open (its open is fixed once
    that bar starts), cost ``cost_bps_per_side`` on the traded fraction. All of it is one
    :meth:`Store.commit_bar` transaction, so the bar is traded at most once.
 4. Mark equity at the latest closed 5m close. If equity is down ``max_daily_loss`` from the
-   first mark of the UTC day, go flat at the next 5m open and pause until next UTC midnight.
+   equity at 00:00 UTC (the 23:55 bar's close, even if the Mac slept through midnight), go
+   flat at the next 5m open and pause until next UTC midnight. A breach seen before that
+   next 5m bar exists is re-checked on later ticks of the same bar.
+
+A book whose stored coin or timeframe differs from books.json is not touched
+(``config_conflict`` event): its position belongs to the old market.
 """
 
 from __future__ import annotations
@@ -26,16 +36,18 @@ import pandas as pd
 
 from profit_engine.intraday.data import find_gaps
 from profit_engine.intraday.resample import resample
+from profit_engine.live.accounting import equity
 from profit_engine.live.market import FIVE_MIN, BarSource, DataUnavailable, split_closed
 from profit_engine.live.notify import Notifier
 from profit_engine.live.registry import BookSpec, LiveConfig, Settings
-from profit_engine.live.store import BarCommit, EventSpec, Store, iso, parse_ts
+from profit_engine.live.store import BarCommit, BookConflict, EventSpec, Store, iso, parse_ts
 from profit_engine.live.strategy import Decision, InvalidTarget, decision_window, normalize_decision, other_window
 
 log = logging.getLogger("signal_desk.runner")
 MARK_LOOKBACK = pd.Timedelta("30min")
 MARK_JUMP_WINDOW = pd.Timedelta("1h")
 SKEW_WARN_S = 60.0
+MAX_WIDEN = 3  # history is doubled at most this many times to find warmup_bars complete bars
 
 
 @dataclass
@@ -74,16 +86,34 @@ def bars_5m(ctx: TickContext, symbol: str, since: pd.Timestamp) -> pd.DataFrame:
     return frame
 
 
-def closed_bars(ctx: TickContext, spec: BookSpec, symbol: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """(5m frame incl. in-progress bar, closed decision bars of the book's timeframe)."""
-    need = max(int(spec.strategy.warmup_bars), 1) + 4
-    frame = bars_5m(ctx, symbol, ctx.now.floor(spec.tf) - spec.tf * need)
+def _resampled(ctx: TickContext, spec: BookSpec, symbol: str, since: pd.Timestamp):
+    frame = bars_5m(ctx, symbol, since)
     closed, _ = split_closed(frame, ctx.now, ctx.settle)
+    bars = closed if closed.empty else resample(closed, spec.timeframe, incomplete="drop")
+    return frame, closed, bars
+
+
+def closed_bars(
+    ctx: TickContext, spec: BookSpec, symbol: str, since: pd.Timestamp | None = None
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(5m frame incl. in-progress bar, closed decision bars of the book's timeframe).
+
+    Without ``since``, the lookback is widened until it holds ``warmup_bars`` complete bars
+    (a data gap drops incomplete bars), or a wider fetch adds no older bar, or MAX_WIDEN."""
+    if since is not None:
+        frame, _, bars = _resampled(ctx, spec, symbol, since)
+        return frame, bars
+    n = max(int(spec.strategy.warmup_bars), 1)
+    span, first = n + 4, None
+    for _ in range(MAX_WIDEN + 1):
+        since = ctx.now.floor(spec.tf) - spec.tf * span
+        frame, closed, bars = _resampled(ctx, spec, symbol, since)
+        if len(bars) >= n or frame.empty or frame.index[0] == first:  # enough, or nothing older exists
+            break
+        span, first = span * 2, frame.index[0]
     if symbol == spec.symbol:
         _note_gaps(ctx, spec, closed)
-    if closed.empty:
-        return frame, closed
-    return frame, resample(closed, spec.timeframe, incomplete="drop")
+    return frame, bars
 
 
 def _note_gaps(ctx: TickContext, spec: BookSpec, closed: pd.DataFrame) -> None:
@@ -126,7 +156,7 @@ def _is_stale(ctx: TickContext, spec: BookSpec, latest: pd.Timestamp) -> bool:
 def _run_strategy(ctx: TickContext, spec: BookSpec, window: pd.DataFrame) -> Decision:
     other = None
     if spec.strategy.other_symbol:
-        _, other_bars = closed_bars(ctx, spec, spec.strategy.other_symbol)
+        _, other_bars = closed_bars(ctx, spec, spec.strategy.other_symbol, since=window.index[0])
         other = other_window(other_bars, window)
     return normalize_decision(spec.strategy.decide(window, other))
 
@@ -172,6 +202,28 @@ class ReadyBar:
     window: pd.DataFrame  # what decide() sees
 
 
+def _halted(ctx: TickContext, spec: BookSpec, frame: pd.DataFrame, latest: pd.Timestamp, fill_ts) -> bool:
+    if "volume" not in frame.columns or not frame.at[fill_ts, "volume"] <= 0:
+        return False
+    ctx.event(
+        spec.book_id, "halted",
+        f"Binance shows no {coin(spec.symbol)} trading at {fill_ts:%Y-%m-%d %H:%M} UTC (an exchange halt), so the "
+        "book did not fill at that stale price. It keeps its position and acts on the next bar with trading.",
+        key=iso(fill_ts), decision_bar=iso(latest), fill_bar=iso(fill_ts),
+    )  # fmt: skip
+    return True
+
+
+def _warming_up(ctx: TickContext, spec: BookSpec, bars: pd.DataFrame) -> None:
+    need = max(int(spec.strategy.warmup_bars), 1)
+    ctx.event(
+        spec.book_id, "warming_up",
+        f"The strategy needs {need} complete {spec.timeframe} bars of {coin(spec.symbol)} history and Binance has "
+        f"{len(bars)} recent ones, so the book kept its position and did not decide on this bar.",
+        key=iso(bars.index[-1]), need=need, have=len(bars),
+    )  # fmt: skip
+
+
 def ready_bar(ctx: TickContext, spec: BookSpec, last: pd.Timestamp | None) -> ReadyBar:
     """The new decision bar and its fill, or raise _Skip with the reason it cannot be traded."""
     frame, bars = closed_bars(ctx, spec, spec.symbol)
@@ -189,11 +241,14 @@ def ready_bar(ctx: TickContext, spec: BookSpec, last: pd.Timestamp | None) -> Re
     fill_ts = latest + spec.tf
     if fill_ts not in frame.index:
         raise _Skip("waiting_for_next_bar")
+    if _halted(ctx, spec, frame, latest, fill_ts):
+        raise _Skip("halted")
     price, close = float(frame.at[fill_ts, "open"]), float(bars.at[latest, "close"])
     if not _price_ok(ctx, spec, price, close, "fill"):
         raise _Skip("bad_price")
     window = decision_window(bars, spec.strategy)
     if window is None:
+        _warming_up(ctx, spec, bars)
         raise _Skip("warming_up")
     return ReadyBar(latest, fill_ts, price, close, window)
 
@@ -247,21 +302,50 @@ def _kill_if_needed(ctx: TickContext, spec: BookSpec, mark: dict, ts: pd.Timesta
     return True
 
 
+def _midnight_price(ctx: TickContext, spec: BookSpec, closed: pd.DataFrame, book: dict, ts) -> float | None:
+    """The 00:00 UTC price of ``ts``'s day (the 23:55 bar's close) when this mark starts a new
+    UTC day for the book; None otherwise, or when Binance has no 23:55 bar."""
+    if book["day"] is None or book["day"] == ts.strftime("%Y-%m-%d"):
+        return None
+    bar = ts.floor("D") - FIVE_MIN
+    if bar not in closed.index:
+        return None
+    price = float(closed.at[bar, "close"])
+    return price if _price_ok(ctx, spec, price, None, "midnight") else None
+
+
+def _recheck_kill(ctx: TickContext, spec: BookSpec, book: dict, ts: pd.Timestamp, frame: pd.DataFrame) -> dict:
+    """Same 5m bar as the last mark: re-run the daily loss check, whose fill bar may only have
+    appeared since (the check needs the next 5m open)."""
+    price = book["last_mark_price"]
+    if price is None or ts not in frame.index:
+        return {"marked": False}
+    mark = {"equity": equity(book["cash"], book["units"], price), "day_start_equity": book["day_start_equity"],
+            "book": book}  # fmt: skip
+    return {"marked": False, "kill_switch": _kill_if_needed(ctx, spec, mark, ts, frame)}
+
+
 def mark_book(ctx: TickContext, spec: BookSpec) -> dict:
     """Mark at the latest closed 5m close (once per bar), then apply the daily loss limit."""
-    frame = bars_5m(ctx, spec.symbol, ctx.now.floor(FIVE_MIN) - MARK_LOOKBACK)
+    book = ctx.store.book(spec.book_id)
+    since = ctx.now.floor(FIVE_MIN) - MARK_LOOKBACK
+    if book["day"] is not None and book["day"] != (ctx.now - ctx.settle).floor(FIVE_MIN).strftime("%Y-%m-%d"):
+        since = min(since, ctx.now.floor("D") - FIVE_MIN)  # a new UTC day: also fetch the 23:55 bar
+    frame = bars_5m(ctx, spec.symbol, since)
     closed, _ = split_closed(frame, ctx.now, ctx.settle)
     if closed.empty:
         return {"marked": False}
     ts, price = closed.index[-1] + FIVE_MIN, float(closed["close"].iloc[-1])
-    book = ctx.store.book(spec.book_id)
     last_ts = parse_ts(book["last_mark_ts"])
-    if last_ts is not None and ts <= last_ts:
+    if last_ts is not None and ts == last_ts:
+        return _recheck_kill(ctx, spec, book, ts, frame)
+    if last_ts is not None and ts < last_ts:
         return {"marked": False}
     near = last_ts is not None and ts - last_ts <= MARK_JUMP_WINDOW
     if not _price_ok(ctx, spec, price, book["last_mark_price"] if near else None, "mark"):
         return {"marked": False}
-    mark = ctx.store.record_mark(spec.book_id, ts, price, ctx.now)
+    midnight = _midnight_price(ctx, spec, closed, book, ts)
+    mark = ctx.store.record_mark(spec.book_id, ts, price, ctx.now, midnight)
     killed = _kill_if_needed(ctx, spec, mark, ts, frame)
     return {"marked": True, "equity": round(mark["equity"], 2), "kill_switch": killed}
 
@@ -324,6 +408,34 @@ def _exchange_time(store: Store, source: BarSource, local: pd.Timestamp) -> pd.T
     return now
 
 
+def _conflict(ctx: TickContext, spec: BookSpec, exc: BookConflict) -> dict:
+    (was_sym, was_tf), (now_sym, now_tf) = exc.stored, exc.wanted
+    log.error("book settings conflict with its history", extra={"book_id": spec.book_id, "error": str(exc)})
+    msg = (
+        f"{spec.title} was started as {coin(was_sym)} {was_tf} bars, but the books settings now give it "
+        f"{coin(now_sym)} {now_tf}. It was not checked, so its paper position is never priced in the wrong market. "
+        "Change it back, or give the new setup its own book_id."
+    )
+    ctx.event(spec.book_id, "config_conflict", msg, key=f"{was_sym}:{was_tf}->{now_sym}:{now_tf}")
+    return {"book_id": spec.book_id, "ok": False, "decision": "config_conflict"}
+
+
+def _register(ctx: TickContext, specs: tuple[BookSpec, ...]) -> tuple[list[BookSpec], list[dict]]:
+    """Upsert every configured book (so turning one off shows on the dashboard); return the
+    enabled books that are safe to run, and results for the ones refused."""
+    runnable, refused = [], []
+    for spec in specs:
+        try:
+            ctx.store.upsert_book(spec, ctx.now)
+        except BookConflict as exc:
+            if spec.enabled:
+                refused.append(_conflict(ctx, spec, exc))
+            continue
+        if spec.enabled:
+            runnable.append(spec)
+    return runnable, refused
+
+
 def tick(
     config: LiveConfig, store: Store, source: BarSource, notifier: Notifier | None = None,
     local_now: pd.Timestamp | None = None,
@@ -336,12 +448,14 @@ def tick(
     if now is None:
         return {"ok": False, "status": "exchange_unreachable", "books": []}
     ctx = TickContext(store, source, settings, notifier, now)
-    books = [spec for spec in config.books if spec.enabled]
-    for spec in books:
-        store.upsert_book(spec, now)
-    results = [safe_process(ctx, spec) for spec in books]
+    books, refused = _register(ctx, config.books)
+    results = refused + [safe_process(ctx, spec) for spec in books]
     notifier.flush(store, now, {spec.book_id: spec.title for spec in books})
     ok = all(r["ok"] for r in results)
-    detail = {"exchange_time": iso(now), "clock_skew_s": round((local - now).total_seconds(), 3), "n_books": len(books)}
+    detail = {
+        "exchange_time": iso(now),
+        "clock_skew_s": round((local - now).total_seconds(), 3),
+        "n_books": len(results),
+    }
     store.beat("runner", "ok" if ok else "degraded", local, detail)
     return {"ok": ok, "status": "ok" if ok else "degraded", **detail, "books": results}

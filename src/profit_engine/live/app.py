@@ -7,6 +7,9 @@ HTML file (``static/index.html``) with inline JS: no build step, no external req
 
 from __future__ import annotations
 
+import logging
+import socket
+import time
 from pathlib import Path
 
 import uvicorn
@@ -20,6 +23,8 @@ HOST = "127.0.0.1"
 PORT = 8765
 STATIC = Path(__file__).resolve().parent / "static" / "index.html"
 NOT_FOUND = "We couldn't find that book. It may have been renamed in books.json."
+PORT_RETRY_S = 30.0
+log = logging.getLogger("signal_desk.dashboard")
 
 
 def create_app(db_path: Path | None = None) -> FastAPI:
@@ -65,7 +70,29 @@ def create_app(db_path: Path | None = None) -> FastAPI:
     return app
 
 
+def _port_free(host: str, port: int) -> bool:
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # as uvicorn does: ignore TIME_WAIT
+        try:
+            probe.bind((host, port))
+        except OSError:
+            return False
+    return True
+
+
+def wait_for_port(host: str, port: int) -> None:
+    """Block until ``port`` is free. Exiting instead would make launchd's KeepAlive relaunch the
+    dashboard every 30 s for as long as something else holds the port."""
+    if _port_free(host, port):
+        return
+    log.warning("port %s is in use; the dashboard will start when it is free", port)
+    while not _port_free(host, port):
+        time.sleep(PORT_RETRY_S)
+
+
 def serve(host: str = HOST, port: int = PORT, db_path: Path | None = None) -> None:
     if host not in ("127.0.0.1", "localhost", "::1"):
         raise ValueError("the live dashboard binds to localhost only")
+    wait_for_port(host, port)
     uvicorn.run(create_app(db_path), host=host, port=port, log_level="warning", access_log=False)

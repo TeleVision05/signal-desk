@@ -24,6 +24,10 @@ from profit_engine.intraday.data import normalize_raw
 FIVE_MIN = pd.Timedelta("5min")
 SERVER_TIME_URL = "https://data-api.binance.vision/api/v3/time"
 CACHE_SPAN = pd.Timedelta(days=21)
+# What normalize_raw is told "now" is. It drops bars with close_time >= now; the runner wants
+# every bar kept (the in-progress bar's OPEN is the fill price) and decides what is closed itself,
+# on Binance's clock. A fixed far-future time, never the Mac's clock, which may be days off.
+KEEP_ALL = pd.Timestamp("2200-01-01", tz="UTC")
 
 
 class DataUnavailable(RuntimeError):
@@ -78,9 +82,7 @@ class BinanceBarSource:
             raw = binance.fetch_rest(symbol, "5m", start_ms, self.session, timeout=self.timeout)
             if raw.empty:
                 return pd.DataFrame(columns=list(KLINE_COLUMNS), index=pd.DatetimeIndex([], tz="UTC"))
-            # normalize_raw drops bars with close_time >= now. Pass a far-future "now" so the
-            # in-progress bar is kept: its OPEN is the fill price. split_closed() decides later.
-            frame, _ = normalize_raw(raw, now=pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=1))
+            frame, _ = normalize_raw(raw, now=KEEP_ALL)  # split_closed() decides what is closed later
             return frame
 
         return self._with_retries(call)

@@ -1,14 +1,17 @@
 """The long-running loop behind ``signal-desk-live run`` (what launchd keeps alive).
 
 * single instance: an exclusive ``flock`` on ``<app folder>/runner.lock`` (released by the
-  OS if the process dies, so a crash never leaves a stale lock);
+  OS if the process dies, so a crash never leaves a stale lock). A second runner WAITS for
+  the lock (checking every :data:`LOCK_RETRY_S`) instead of exiting, so launchd's KeepAlive
+  never turns a manual ``run`` in a terminal into a relaunch loop;
 * every ``poll_seconds`` (default 30) with +/- ``jitter`` so the requests do not line up
   with every other client on the minute, backing off exponentially (max 10 minutes)
   while Binance is unreachable;
 * SIGTERM / SIGINT finish the current tick and exit cleanly (launchd sends SIGTERM);
 * ``books.json`` is re-read every loop, so edits apply without a restart (a broken edit
   keeps the last good config and logs an event);
-* structured JSON logs in ``~/Library/Logs/SignalDesk/runner.jsonl`` (rotated).
+* structured JSON logs in ``~/Library/Logs/SignalDesk/runner.jsonl`` (rotated); under launchd
+  (``run --no-console-log``) nothing is copied to stderr, whose file never rotates.
 
 A sleeping Mac runs nothing. On wake the next tick sees the newest closed bar, acts on it
 alone and records how many bars were missed (``catch_up`` event).
@@ -37,6 +40,7 @@ from profit_engine.live.store import EventSpec, Store
 
 log = logging.getLogger("signal_desk.service")
 MAX_BACKOFF_S = 600.0
+LOCK_RETRY_S = 30.0
 _STD_ATTRS = set(logging.LogRecord("", 0, "", 0, "", None, None).__dict__) | {"message", "asctime"}
 
 
@@ -124,16 +128,27 @@ def _reload(store: Store, previous: LiveConfig | None) -> LiveConfig | None:
         return previous
 
 
+def wait_for_lock(lock: InstanceLock, stop: threading.Event) -> bool:
+    """Take the single-instance lock, waiting while another runner holds it. False if stopped first."""
+    if lock.acquire():
+        return True
+    log.warning("another Signal Desk Live runner is already running; waiting for it to stop")
+    while not stop.wait(LOCK_RETRY_S):
+        if lock.acquire():
+            log.info("the other runner stopped; this one takes over")
+            return True
+    return False
+
+
 def run_forever(stop: threading.Event | None = None, source: BarSource | None = None) -> int:
     """Loop until SIGTERM/SIGINT (or ``stop`` is set). Returns a process exit code."""
-    lock = InstanceLock(paths.lock_path())
-    if not lock.acquire():
-        log.warning("another Signal Desk Live runner is already running; exiting")
-        return 0
     stop = stop or threading.Event()
     if threading.current_thread() is threading.main_thread():
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: stop.set())
+    lock = InstanceLock(paths.lock_path())
+    if not wait_for_lock(lock, stop):
+        return 0
     store, source = Store(paths.db_path()), source or BinanceBarSource()
     rng, failures, config = random.Random(), 0, None
     log.info("runner started", extra={"db": str(store.path), "pid": os.getpid()})

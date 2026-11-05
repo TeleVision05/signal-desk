@@ -23,6 +23,7 @@
 		<string>-m</string>
 		<string>profit_engine.live.cli</string>
 		<string>run</string>
+		<string>--no-console-log</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

@@ -42,6 +42,15 @@ FORWARDED_ENV = (
     "SIGNAL_DESK_LOGS",
     "SIGNAL_DESK_NOTIFY",
 )
+NOT_PATHS = {"SIGNAL_DESK_NOTIFY"}
+
+
+def _forwarded(name: str, value: str) -> str:
+    """Path variables become absolute: the agents run in the repo, the CLI in the user's cwd,
+    and both must open the same files. A URL is passed through (``paths.db_path`` refuses it)."""
+    if name in NOT_PATHS or "://" in value:
+        return value
+    return str(Path(value).expanduser().resolve())
 
 
 @dataclass(frozen=True)
@@ -68,14 +77,14 @@ def default_plan(stay_awake_on_ac: bool = False, dashboard: bool = True) -> Inst
         logs=paths.logs_dir(),
         stay_awake_on_ac=stay_awake_on_ac,
         dashboard=dashboard,
-        env={k: os.environ[k] for k in FORWARDED_ENV if os.environ.get(k)},
+        env={k: _forwarded(k, os.environ[k]) for k in FORWARDED_ENV if os.environ.get(k)},
     )
 
 
-def _agent(plan: InstallPlan, label: str, command: str, prefix: list[str], log_name: str) -> dict:
+def _agent(plan: InstallPlan, label: str, command: list[str], prefix: list[str], log_name: str) -> dict:
     return {
         "Label": label,
-        "ProgramArguments": [*prefix, str(plan.python), "-m", "profit_engine.live.cli", command],
+        "ProgramArguments": [*prefix, str(plan.python), "-m", "profit_engine.live.cli", *command],
         "WorkingDirectory": str(plan.repo),
         "EnvironmentVariables": {"PYTHONPATH": str(plan.repo / "src"), "PYTHONUNBUFFERED": "1", **plan.env},
         "RunAtLoad": True,
@@ -89,11 +98,12 @@ def _agent(plan: InstallPlan, label: str, command: str, prefix: list[str], log_n
 
 def runner_plist(plan: InstallPlan) -> dict:
     prefix = [CAFFEINATE, "-s"] if plan.stay_awake_on_ac else []
-    return _agent(plan, RUNNER_LABEL, "run", prefix, "runner")
+    # The JSON log already goes to the rotated runner.jsonl; stderr (never rotated) keeps crashes only.
+    return _agent(plan, RUNNER_LABEL, ["run", "--no-console-log"], prefix, "runner")
 
 
 def dashboard_plist(plan: InstallPlan) -> dict:
-    return _agent(plan, DASHBOARD_LABEL, "dashboard", [], "dashboard")
+    return _agent(plan, DASHBOARD_LABEL, ["dashboard"], [], "dashboard")
 
 
 def agents(plan: InstallPlan) -> list[tuple[str, dict]]:
@@ -112,6 +122,20 @@ Runner = Callable[[list[str]], int]
 
 def _run(cmd: list[str]) -> int:
     return subprocess.run(cmd, check=False).returncode
+
+
+def _retire(label: str, plan: InstallPlan, dry_run: bool, run: Runner, out: Callable[[str], None], uid: int) -> None:
+    """Stop an agent and delete its plist (a no-op if it was never installed)."""
+    path = plan.agents_dir / f"{label}.plist"
+    bootout = ["launchctl", "bootout", f"gui/{uid}/{label}"]
+    if dry_run:
+        out(f"Would run: {shlex.join(bootout)}   (ignored if not loaded)")
+        out(f"Would delete {path}")
+        return
+    run(bootout)
+    if path.exists():
+        path.unlink()
+        out(f"Removed {label}.")
 
 
 def install(
@@ -139,6 +163,8 @@ def install(
             failed += 1
         else:
             out(f"Installed and started {label} ({path}).")
+    if not plan.dashboard:  # runner only: stop a dashboard agent left by an earlier full install
+        _retire(DASHBOARD_LABEL, plan, dry_run, run, out, uid)
     return 1 if failed else 0
 
 
@@ -149,14 +175,5 @@ def uninstall(
     """Stop both agents and delete their plists (data and logs are kept)."""
     uid = os.getuid() if uid is None else uid
     for label in (RUNNER_LABEL, DASHBOARD_LABEL):
-        path = plan.agents_dir / f"{label}.plist"
-        bootout = ["launchctl", "bootout", f"gui/{uid}/{label}"]
-        if dry_run:
-            out(f"Would run: {shlex.join(bootout)}   (ignored if not loaded)")
-            out(f"Would delete {path}")
-            continue
-        run(bootout)
-        if path.exists():
-            path.unlink()
-            out(f"Removed {label}.")
+        _retire(label, plan, dry_run, run, out, uid)
     return 0

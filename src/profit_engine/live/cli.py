@@ -28,9 +28,9 @@ def _config_or_exit():
         return None
 
 
-def cmd_run(_: argparse.Namespace) -> int:
+def cmd_run(args: argparse.Namespace) -> int:
 
-    setup_logging("runner")
+    setup_logging("runner", to_stderr=not args.no_console_log)
     return run_forever()
 
 
@@ -98,7 +98,12 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="signal-desk-live", description=f"Signal Desk Live paper runner. {PAPER}")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("run", help="run the paper-trading loop (what launchd keeps alive)").set_defaults(fn=cmd_run)
+    r = sub.add_parser("run", help="run the paper-trading loop (what launchd keeps alive)")
+    r.add_argument(
+        "--no-console-log", action="store_true",
+        help="log to the rotated runner.jsonl only, not also to stderr (launchd's stderr file never rotates)",
+    )  # fmt: skip
+    r.set_defaults(fn=cmd_run)
     t = sub.add_parser("tick", help="check every book once and print the result")
     t.add_argument("--no-notify", action="store_true", help="do not show macOS notifications")
     t.set_defaults(fn=cmd_tick)
