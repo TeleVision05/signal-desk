@@ -13,9 +13,11 @@ replaces the artifact in use. A bar is decided by the newest folder for the mont
 (:func:`folder_for_month`), as the research decides month M with fold M's model.
 
 A month whose training found no profitable threshold leaves a marker file
-``.no-threshold-<YYYY-MM>.json`` next to the folders: that month keeps the newest earlier model
-(the research stayed in cash; see docs/live_runner.md, Known limitations), and the hourly
-retrain does not train it again (the result would be the same: training is deterministic).
+``.no-threshold-<YYYY-MM>.json`` next to the folders: the book stays in cash for that month,
+as the research did (``oos_positions`` leaves the target at 0 when the threshold is infinite),
+and needs no model for it. The hourly retrain does not train the month again (training is
+deterministic) unless the installed library versions differ from the ones the marker records,
+as an artifact from other versions is retrained.
 
 ``metadata.json`` records the config, model parameters, feature columns, threshold and the
 quantile it came from, the training window, a hash of the 5m data, the git sha and the
@@ -180,6 +182,26 @@ def check_versions(meta: dict) -> None:
         raise UnusableArtifact(f"it was trained with {said}", VERSIONS_REASON)
 
 
+# What the book reads from metadata.json, and the type each must have.
+REQUIRED_META = {"version": str, "trades_month": str, "threshold": float, "train_window": dict, "feature_columns": list}
+
+
+def check_meta(meta: object, path: Path) -> dict:
+    """``meta`` if it holds every key the book reads, with a usable value; else UnusableArtifact
+    (a hand edit, or an artifact from an older metadata layout)."""
+    if not isinstance(meta, dict):
+        raise UnusableArtifact(f"{path} does not hold a JSON object", INCOMPLETE_REASON)
+    for key, kind in REQUIRED_META.items():
+        value = meta.get(key)
+        if kind is float:
+            ok = isinstance(value, int | float) and not isinstance(value, bool) and bool(np.isfinite(value))
+        else:
+            ok = isinstance(value, kind) and bool(value)
+        if not ok:
+            raise UnusableArtifact(f"{path}: {key!r} is missing or not a valid {kind.__name__}", INCOMPLETE_REASON)
+    return meta
+
+
 def load(folder: Path) -> Loaded:
     """Load one artifact; ArtifactError if it is incomplete, altered, or from other library versions."""
     folder = Path(folder)
@@ -187,6 +209,7 @@ def load(folder: Path) -> Loaded:
         meta = json.loads((folder / META_FILE).read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise UnusableArtifact(f"{folder / META_FILE} is missing or unreadable", INCOMPLETE_REASON) from exc
+    check_meta(meta, folder / META_FILE)
     check_versions(meta)
     path = folder / str(meta.get("artifact", MODEL_FILE))
     if not path.exists():
@@ -220,7 +243,7 @@ def _marker(models_dir: Path, cfg_name: str, symbol: str, month: str) -> Path:
 
 
 def mark_no_threshold(models_dir: Path, cfg_name: str, symbol: str, month: str, now: pd.Timestamp) -> None:
-    """Record that ``month``'s training found no profitable threshold (it keeps the earlier model)."""
+    """Record that ``month``'s training found no profitable threshold (the book is flat that month)."""
     path = _marker(models_dir, cfg_name, symbol, month)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -229,17 +252,17 @@ def mark_no_threshold(models_dir: Path, cfg_name: str, symbol: str, month: str, 
 
 
 def has_no_threshold(models_dir: Path, cfg_name: str, symbol: str, month: str) -> bool:
-    return _marker(models_dir, cfg_name, symbol, month).exists()
+    """Whether ``month`` is known to have no profitable threshold under the installed libraries
+    (a marker written under other versions, or unreadable, does not count: train it again)."""
+    try:
+        found = json.loads(_marker(models_dir, cfg_name, symbol, month).read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(found, dict) and found.get("versions") == library_versions()
 
 
 def folder_for_month(models_dir: Path, cfg_name: str, symbol: str, month: str) -> Path | None:
-    """The artifact that decides bars opening in ``month``: the newest folder trained for it, else
-    (only if that month found no threshold) the newest earlier one; None if there is none yet."""
-    found = versions(models_dir, cfg_name, symbol)
-    same = [p for p in found if trades_month(p) == month]
-    if same:
-        return same[-1]
-    if has_no_threshold(models_dir, cfg_name, symbol, month):
-        earlier = [p for p in found if trades_month(p) < month]
-        return earlier[-1] if earlier else None
-    return None
+    """The artifact that decides bars opening in ``month``: the newest folder trained for it; None
+    if there is none (not trained yet, or a month with no threshold, see :func:`has_no_threshold`)."""
+    same = [p for p in versions(models_dir, cfg_name, symbol) if trades_month(p) == month]
+    return same[-1] if same else None

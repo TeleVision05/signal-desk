@@ -15,10 +15,14 @@ from functools import cache
 import numpy as np
 import pandas as pd
 import pytest
+from live_helpers import FakeSource, book, rows
+from live_helpers import config as live_config
 from parity_helpers import bars, raw_5m, require_cache, research
 
 from profit_engine.intraday import config, labels, splits
 from profit_engine.live import cli
+from profit_engine.live.runner import tick
+from profit_engine.live.store import iso
 from profit_engine.live.strategies import lgbm_artifacts as art
 from profit_engine.live.strategies import lgbm_core as core
 from profit_engine.live.strategies.lgbm import LgbmStrategy
@@ -110,6 +114,23 @@ def test_live_decisions_on_the_following_month_equal_the_research_target(trained
     got = pd.Series(got)
     assert len(got) == 180 and 0 < got.sum() < len(got)
     assert got.equals(want["target"].astype(float))
+
+
+@pytest.mark.parametrize("symbol", SYMBOLS)
+def test_the_book_through_the_runner_decides_every_june_bar_as_the_research(trained, symbol, store, quiet):
+    """The same month through ``tick()`` every 4h: the runner fetches the other coin, slices it to
+    the window, and feeds the stateful hold; every decision must equal the research target."""
+    want, strategy = research_fold(symbol), trained[symbol]
+    first = MONTH - pd.Timedelta("4h") * (strategy.warmup_bars + 200)  # the history the runner asks for
+    frames = {s: raw_5m(s)[raw_5m(s).index >= first] for s in SYMBOLS}
+    cfg = live_config(book(strategy, max_daily_loss=0.0))
+    src = FakeSource(frames, MONTH)
+    for bar in want["target"].index[:-1]:  # the last bar's fill bar is in July, past the cache
+        src.now = bar + pd.Timedelta("4h30s")
+        assert tick(cfg, store, src, quiet)["books"][0]["decision"] in ("traded", "held")
+    got = rows(store, "SELECT bar_open_ts, target FROM decisions ORDER BY bar_open_ts")
+    expected = want["target"].astype(float).iloc[:-1]
+    assert [(d["bar_open_ts"], d["target"]) for d in got] == [(iso(t), x) for t, x in expected.items()]
 
 
 def test_training_uses_only_closed_bars_before_the_cutoff():

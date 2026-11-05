@@ -18,9 +18,11 @@ Per enabled book:
    bar: while none of its 5m bars seen so far has volume, the book waits (``halted`` event once
    a closed 5m bar shows it); as soon as one trades, it fills at the fill bar's open, which is
    the harness price. A fill bar that ends with no trading is skipped and the next decision
-   supersedes it. Decision bars not acted on are counted in a ``catch_up`` event, never
-   replayed. Cost ``cost_bps_per_side`` on the traded fraction. All of it is one
-   :meth:`Store.commit_bar` transaction, so the bar is traded at most once.
+   supersedes it. Decision bars not acted on are counted in a ``catch_up`` event and never
+   traded; a stateful strategy's own state (the trend band) is first run through them without
+   trading (:mod:`catchup`), so it decides from where the research would be. Cost
+   ``cost_bps_per_side`` on the traded fraction. All of it is one :meth:`Store.commit_bar`
+   transaction, so the bar is traded at most once.
 4. Mark equity at the latest closed 5m close. If equity is down ``max_daily_loss`` from the
    equity at 00:00 UTC (the 23:55 bar's close, even if the Mac slept through midnight), go
    flat at the next 5m open and pause until next UTC midnight. A breach seen before that
@@ -40,6 +42,7 @@ import pandas as pd
 
 from profit_engine.intraday.data import find_gaps
 from profit_engine.intraday.resample import resample
+from profit_engine.live import catchup
 from profit_engine.live.accounting import equity
 from profit_engine.live.market import FIVE_MIN, BarSource, DataUnavailable, split_closed
 from profit_engine.live.notify import Notifier
@@ -107,16 +110,16 @@ def _resampled(ctx: TickContext, spec: BookSpec, symbol: str, since: pd.Timestam
 
 
 def closed_bars(
-    ctx: TickContext, spec: BookSpec, symbol: str, since: pd.Timestamp | None = None
+    ctx: TickContext, spec: BookSpec, symbol: str, since: pd.Timestamp | None = None, need: int | None = None
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """(5m frame incl. in-progress bar, closed decision bars of the book's timeframe).
 
-    Without ``since``, the lookback is widened until it holds ``warmup_bars`` complete bars
-    (a data gap drops incomplete bars), or a wider fetch adds no older bar, or MAX_WIDEN."""
+    Without ``since``, the lookback is widened until it holds ``need`` (default ``warmup_bars``)
+    complete bars (a data gap drops incomplete bars), or a wider fetch adds no older bar, or MAX_WIDEN."""
     if since is not None:
         frame, _, bars = _resampled(ctx, spec, symbol, since)
         return frame, bars
-    n = max(int(spec.strategy.warmup_bars), 1)
+    n = need or max(int(spec.strategy.warmup_bars), 1)
     span, first = n + max(4, n // 50), None  # a 2% margin absorbs the odd gap without a doubling
     for _ in range(MAX_WIDEN + 1):
         since = ctx.now.floor(spec.tf) - spec.tf * span
@@ -166,35 +169,20 @@ def _is_stale(ctx: TickContext, spec: BookSpec, latest: pd.Timestamp) -> bool:
     return True
 
 
-def _run_strategy(ctx: TickContext, spec: BookSpec, window: pd.DataFrame) -> Decision:
-    """Decide on ``window``; a stateful strategy continues from its own last persisted target."""
-    other = None
-    if spec.strategy.other_symbol:
-        _, other_bars = closed_bars(ctx, spec, spec.strategy.other_symbol, since=window.index[0])
-        other = other_window(other_bars, window)
-    prev = ctx.store.strategy_target(spec.book_id) if getattr(spec.strategy, "stateful", False) else 0.0
-    return normalize_decision(call_decide(spec.strategy, window, other, prev))
-
-
-def _catch_up(spec: BookSpec, skipped: int, latest: pd.Timestamp) -> tuple[EventSpec, ...]:
-    if not skipped:
-        return ()
-    text = (
-        f"{skipped} {spec.timeframe} decision bar(s) since the last decision were not acted on: the Mac was "
-        "asleep or offline, or those bars could not be traded (see the earlier events). The book acted on the "
-        "latest closed bar only; missed bars are not replayed."
-    )
-    return (EventSpec("catch_up", text, {"skipped_bars": skipped}, iso(latest)),)
-
-
-def _skipped(spec: BookSpec, frame: pd.DataFrame, bars: pd.DataFrame, last, latest: pd.Timestamp) -> int:
-    """Decision bars between ``last`` and ``latest`` that existed but were not decided. Bars that
-    were dropped for missing 5m data (a logged gap) never existed as decision bars."""
-    if last is None:
-        return 0
-    slots = pd.date_range(last + spec.tf, latest - spec.tf, freq=spec.tf)
-    dropped = int(((slots >= frame.index[0]) & ~slots.isin(bars.index)).sum())
-    return len(slots) - dropped
+def _run_strategy(ctx: TickContext, spec: BookSpec, bar: ReadyBar, last: pd.Timestamp | None) -> Decision:
+    """Decide on ``bar.window``. A stateful strategy continues from its own last persisted target,
+    first run through the bars it did not decide (:func:`catchup.advance`); details say how many."""
+    s, other_bars, other = spec.strategy, None, None
+    if s.other_symbol:
+        since = (bar.bars if catchup.state_bars(s) else bar.window).index[0]
+        _, other_bars = closed_bars(ctx, spec, s.other_symbol, since=since)
+        other = other_window(other_bars, bar.window)
+    prev = ctx.store.strategy_target(spec.book_id) if getattr(s, "stateful", False) else 0.0
+    prev, replayed = catchup.advance(s, bar.bars, last, prev, other_bars)
+    decision = normalize_decision(call_decide(s, bar.window, other, prev))
+    if not replayed:
+        return decision
+    return Decision(decision.target, decision.explanation, {**decision.details, "replayed_bars": replayed})
 
 
 def _fill_text(spec: BookSpec, fill) -> str:
@@ -218,6 +206,7 @@ class ReadyBar:
     close: float  # the decision bar's close
     window: pd.DataFrame  # what decide() sees
     skipped: int  # decision bars since the last decision that were not acted on
+    bars: pd.DataFrame  # every closed bar fetched (the window and the bars a stateful strategy replays)
 
 
 def _halted(ctx: TickContext, spec: BookSpec, frame: pd.DataFrame, latest: pd.Timestamp, fill_ts) -> str | None:
@@ -255,7 +244,8 @@ def _warming_up(ctx: TickContext, spec: BookSpec, bars: pd.DataFrame) -> None:
 
 def ready_bar(ctx: TickContext, spec: BookSpec, last: pd.Timestamp | None) -> ReadyBar:
     """The new decision bar and its fill, or raise _Skip with the reason it cannot be traded."""
-    frame, bars = closed_bars(ctx, spec, spec.symbol)
+    need = catchup.history_needed(spec.strategy, last, latest_due_bar(ctx.now, spec.tf, ctx.settle), spec.tf)
+    frame, bars = closed_bars(ctx, spec, spec.symbol, need=need)
     if bars.empty:
         raise _Skip("waiting_for_data")
     latest = bars.index[-1]
@@ -278,7 +268,8 @@ def ready_bar(ctx: TickContext, spec: BookSpec, last: pd.Timestamp | None) -> Re
     if window is None:
         _warming_up(ctx, spec, bars)
         raise _Skip("warming_up")
-    return ReadyBar(latest, fill_ts, price, close, window, _skipped(spec, frame, bars, last, latest))
+    skipped = catchup.skipped(spec.tf, frame, bars, last, latest)
+    return ReadyBar(latest, fill_ts, price, close, window, skipped, bars)
 
 
 def decide_book(ctx: TickContext, spec: BookSpec, book: dict) -> str:
@@ -291,7 +282,7 @@ def decide_book(ctx: TickContext, spec: BookSpec, book: dict) -> str:
         if getattr(spec.strategy, "problem", ""):  # e.g. no trained model: say so before fetching history
             raise StrategyUnavailable(spec.strategy.problem)
         bar = ready_bar(ctx, spec, last)
-        decision = _run_strategy(ctx, spec, bar.window)
+        decision = _run_strategy(ctx, spec, bar, last)
     except _Skip as skip:
         return skip.status
     except StrategyUnavailable as exc:
@@ -299,10 +290,11 @@ def decide_book(ctx: TickContext, spec: BookSpec, book: dict) -> str:
         log.warning("strategy unavailable", extra={"book_id": spec.book_id, "error": str(exc), "detail": detail})
         ctx.event(spec.book_id, "model_unavailable", str(exc), key=_bucket(ctx.now, 60))
         return "model_unavailable"
+    events = catchup.catch_up_events(spec.timeframe, bar.skipped, decision.details.get("replayed_bars", 0), bar.latest)
     commit = ctx.store.commit_bar(
         spec.book_id,
         BarCommit(bar.latest, bar.fill_ts, decision, bar.price, bar.close, spec.cost_bps_per_side, ctx.now,
-                  spec.strategy.meta.version, bar.skipped, _catch_up(spec, bar.skipped, bar.latest)),
+                  spec.strategy.meta.version, bar.skipped, events),
     )  # fmt: skip
     if not commit.claimed:
         return "already_done"
@@ -456,8 +448,10 @@ def _conflict(ctx: TickContext, spec: BookSpec, exc: BookConflict) -> dict:
 
 
 def _register(ctx: TickContext, specs: tuple[BookSpec, ...]) -> tuple[list[BookSpec], list[dict]]:
-    """Upsert every configured book (so turning one off shows on the dashboard); return the
-    enabled books that are safe to run, and results for the ones refused."""
+    """Upsert every configured book (so turning one off shows on the dashboard) and turn off any
+    book no longer in the settings; return the enabled books that are safe to run, and results
+    for the ones refused."""
+    ctx.store.turn_off_unlisted([spec.book_id for spec in specs], ctx.now)
     runnable, refused = [], []
     for spec in specs:
         try:

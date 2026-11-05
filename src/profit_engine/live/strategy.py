@@ -12,7 +12,8 @@ bar by bar with the same window, which is how a backtest of the live code path i
 
 A strategy whose next target depends on its own previous one (a hysteresis band) sets
 ``stateful = True``; :func:`call_decide` then passes ``prev_target``: the strategy's own last
-target as the runner persisted it (before any daily-loss pause), or 0.0 for a new book.
+target as the runner persisted it (before any daily-loss pause), or 0.0 for a new book; with
+``state_bars`` > 0 the runner first steps it through the bars it did not decide (``catchup.py``).
 A strategy that cannot decide at all (say its model file is missing) raises
 :class:`StrategyUnavailable` with a plain-language message; the book keeps its position.
 """

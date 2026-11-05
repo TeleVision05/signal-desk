@@ -8,7 +8,9 @@ The research rule (family ``voltarget_trend``) computes a raw exposure per bar,
 and then moves the target to ``round(raw / 0.05) * 0.05`` only when ``|raw - target| > band``
 (a raw that rounds to 0 exits at once). That last step is path dependent, so the live
 strategy never re-runs it over its window: it takes ``prev_target`` (the book's own last
-target, persisted by the runner) and applies ONE step of the band to the newest bar.
+target, persisted by the runner) and applies ONE step of the band to the newest bar. Bars the
+runner did not decide (and, for a new book, the ``state_bars`` before its first decision) are
+stepped through first by ``live/catchup.py``, without trading.
 Replayed bar by bar from the first bar with ``prev_target`` fed back, it reproduces the
 research target exactly (``tests/live/test_live_trend_parity.py``).
 
@@ -51,6 +53,11 @@ CONFIGS: dict[str, dict] = {
     },
 }
 WARMUP_BARS = {"vt_1h_slow4_z_s30": 3600}
+# Bars the band is replayed over (live/catchup.py): the bars a book missed, and before a new
+# book's first decision, so it starts where the research band most likely is. Measured
+# 2026-11-05 (2025-01..2026-06, 200 random start bars per symbol): from flat, the band took up
+# to 946 (BTC) and 3160 (ETH) bars to agree with the research; 3600 covers both.
+STATE_BARS = {"vt_1h_slow4_z_s30": 3600}
 
 
 def ewma_sigma(df: pd.DataFrame, hl_bars: float) -> pd.Series:
@@ -142,7 +149,7 @@ class VolTargetTrend:
             raise ValueError(f"{config} trades {cfg['tf']} bars, not {timeframe}")
         self.symbol, self.timeframe, self.config = symbol, timeframe, config
         self.params = dict(cfg["params"])
-        self.warmup_bars = WARMUP_BARS[config]
+        self.warmup_bars, self.state_bars = WARMUP_BARS[config], STATE_BARS[config]
         self.other_symbol = None
         self.meta = StrategyMeta(
             version="1",  # the config name is in params; the dashboard shows "voltarget_trend v1"

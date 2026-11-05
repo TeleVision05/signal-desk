@@ -16,9 +16,9 @@ quietly produce a model trained on less data.
 (an artifact that fails to load, say after a library upgrade or a damaged file, is retrained,
 which is what the book's "Retrain it" message promises). A failed training publishes nothing,
 so the month's bars wait (the book keeps its position) and the next hourly run tries again.
-It keeps the previous artifact in use when no threshold makes money (research would trade flat that month; the live
-book keeps the last model instead, a marker records it so the hourly job does not train the
-month again, and the event says so). It is safe to run any number of times: an up-to-date
+When no threshold makes money, nothing is published: a marker records it, the book stays in
+cash that month as the research did, the hourly job does not train the month again (unless the
+library versions change), and the event says so. It is safe to run any number of times: an up-to-date
 model is not retrained, so the launchd job runs it every hour (``macos.RETRAIN_TIMES``) and a
 new UTC month's model is ready before that month's first 4h bar closes.
 """
@@ -90,7 +90,8 @@ def train_and_publish(
 
 
 def month_ready(models_dir: Path, cfg_name: str, symbol: str, cutoff: pd.Timestamp) -> bool:
-    """Whether the month starting at ``cutoff`` has a model that loads (or is known to have none)."""
+    """Whether the month starting at ``cutoff`` has a model that loads (or is known to need none:
+    no profitable threshold under the installed library versions)."""
     month = f"{cutoff:%Y-%m}"
     same = [p for p in art.versions(models_dir, cfg_name, symbol) if art.trades_month(p) == month]
     if not same:
@@ -122,16 +123,16 @@ def _retrain_one(
     if month_ready(models_dir, cfg_name, symbol, cutoff):
         if art.has_no_threshold(models_dir, cfg_name, symbol, f"{cutoff:%Y-%m}"):
             return "up_to_date", (
-                f"The {coin} LightGBM model for {cutoff:%B %Y} found no setting that made money, so the book "
-                "keeps its previous model."
+                f"Training the {coin} LightGBM model for {cutoff:%B %Y} found no setting that made money, so the "
+                "book stays in cash this month."
             )
         return "up_to_date", f"The {coin} LightGBM model for {cutoff:%B %Y} is already trained."
     try:
         folder = train_and_publish(frames(), symbol, cutoff, models_dir, cfg_name, now)
     except art.NoThreshold:
-        return "kept_old", (
-            f"Retraining the {coin} LightGBM model for {cutoff:%B %Y} found no setting that made money in "
-            "training, so the book keeps using its previous model (the backtest would have stayed in cash)."
+        return "flat_month", (
+            f"Training the {coin} LightGBM model for {cutoff:%B %Y} found no setting that made money, so the "
+            "book stays in cash this month, as the backtest did."
         )
     except Exception:  # any failure publishes nothing; the detail is logged (retrain.jsonl)
         log.exception("retrain failed", extra={"symbol": symbol, "cutoff": iso(cutoff)})

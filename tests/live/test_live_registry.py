@@ -35,6 +35,7 @@ def test_default_config_is_the_four_research_books_and_no_demo():
     assert sorted(ids) == ["btc-lgbm-4h", "btc-trend-1h", "eth-lgbm-4h", "eth-trend-1h"]
     for b in cfg.books:
         assert b.starting_equity == 1000.0 and b.cost_bps_per_side == 5.0 and b.enabled
+        assert b.max_daily_loss == 0.0  # no loss limit: the research never sold out on a bad day
         assert not isinstance(b.strategy, SmaTrendDemo) and not b.strategy.meta.promoted
     trend, lgbm = ids["btc-trend-1h"].strategy, ids["eth-lgbm-4h"].strategy
     assert isinstance(trend, VolTargetTrend) and trend.config == "vt_1h_slow4_z_s30" and trend.timeframe == "1h"

@@ -7,7 +7,8 @@ never places an order anywhere. It is separate from the Render app (`server.py`,
 never reads `DATABASE_URL`, even when it is set.
 
 By default (`config/live_books.json`) it runs **four books, $1,000 of paper cash each, 5 bps
-per side**, two strategies on two coins, side by side (see [The research books](#the-research-books)):
+per side, no daily loss limit** (the research backtests had none, and the books are there to be
+compared with them), two strategies on two coins, side by side (see [The research books](#the-research-books)):
 
 | book_id | strategy | bars | dashboard label |
 |---|---|---|---|
@@ -47,9 +48,9 @@ Every 30 s (with +/-10 % jitter), for each enabled book:
 | 2. new bar? | If no bar of the book's timeframe can have closed since the last one processed, skip to step 6 (a small request for the last 30 minutes of 5m bars). |
 | 3. bars | Fetch recent 5m klines from `data-api.binance.vision` (`intraday.binance.fetch_rest`). A 5m bar counts as closed once `open + 5m + settle (2 s) <= exchange time`; the in-progress bar is dropped from everything except its **open**. Resample with the harness `resample(..., incomplete="drop")`. If a data gap leaves fewer than `warmup_bars` complete bars, the lookback is doubled (up to 3 times) so a warmed-up book keeps deciding on the same window the harness uses; if it still falls short, a `warming_up` event says so. |
 | 4. guards | No trade, and an event instead, when: the newest complete bar ended more than 2 timeframes ago (`stale_data`, checked even when that bar was already traded, so a feed that stops publishing is never reported as up to date; the heartbeat turns "degraded"); the fill price is off by more than 25 % from the decision close (`bad_price`); the fill bar has not started yet (retry next tick); no 5m bar of the fill bar has traded yet (`halted` once a closed 5m bar shows zero volume, i.e. an exchange halt; a bar in progress with no trades yet just waits, without an event). |
-| 5. decide + fill | The strategy sees the last `warmup_bars` closed bars and returns a target in [0, 1]. A stateful strategy (the trend book's band) also gets its own last target from the database (what it asked for, even if a loss pause overrode it; 0 for a new book). The target fills at the open of the **bar now in progress**, which is the next bar that exists, exactly as the harness fills: normally the bar right after the decision bar; after a bar dropped for missing 5m data (`gap`), the one after that. During a halt the fill waits until a 5m bar of the fill bar trades and then uses the fill bar's open (the harness price); a fill bar with no trading at all is skipped and the next decision supersedes it. Cost `cost_bps_per_side` (5) on the traded fraction. Claim, fill, position and events are **one SQLite transaction**; a daily-loss pause is read inside that transaction, so a pause set by another process a moment earlier is always applied. |
+| 5. decide + fill | The strategy sees the last `warmup_bars` closed bars and returns a target in [0, 1]. A stateful strategy (the trend book's band) also gets its own last target from the database (what it asked for, even if a loss pause overrode it), first moved through any bars that were not decided, without trading (see [Sleep and wake](#sleep-and-wake)); a new book's band is run over the 3600 bars before its first decision, starting flat. The target fills at the open of the **bar now in progress**, which is the next bar that exists, exactly as the harness fills: normally the bar right after the decision bar; after a bar dropped for missing 5m data (`gap`), the one after that. During a halt the fill waits until a 5m bar of the fill bar trades and then uses the fill bar's open (the harness price); a fill bar with no trading at all is skipped and the next decision supersedes it. Cost `cost_bps_per_side` (5) on the traded fraction. Claim, fill, position and events are **one SQLite transaction**; a daily-loss pause is read inside that transaction, so a pause set by another process a moment earlier is always applied. |
 | 6. mark | Equity is marked at the latest closed 5m close (once per 5m bar). |
-| 7. loss limit | If equity is down `max_daily_loss` (5 %) from the equity at 00:00 UTC (the position held at midnight, valued at the 23:55 bar's close): sell to cash at the next 5m open, pause until next UTC midnight, event + notification. If the next 5m bar is not served yet, later ticks in the same 5m bar re-check. While paused, decisions are still recorded (as "stay in cash"). |
+| 7. loss limit | Off in the default books (`"max_daily_loss": 0`). When set, if equity is down `max_daily_loss` (say 5 %) from the equity at 00:00 UTC (the position held at midnight, valued at the 23:55 bar's close): sell to cash at the next 5m open, pause until next UTC midnight, event + notification. If the next 5m bar is not served yet, later ticks in the same 5m bar re-check. While paused, decisions are still recorded (as "stay in cash"). |
 
 This is the harness timing contract (`docs/intraday_harness.md`): decide at bar *t* close,
 fill at bar *t+1* open, cost on |Δposition|, never the in-progress bar.
@@ -81,8 +82,14 @@ that close meanwhile are not traded. On wake, the next tick acts on the **newest
 only**, fills it at the next bar's open, and records a `catch_up` event with how many decision
 bars were not acted on. That count also includes bars skipped for a halt, a bad price or a
 strategy error (the event says so; the earlier events say which). Bars dropped for missing
-5m data are not counted: they never existed as decision bars. Missed bars are never replayed (replaying would trade at prices you could
-no longer get). The loss-limit baseline is the equity at 00:00 UTC even when the Mac slept
+5m data are not counted: they never existed as decision bars. Missed bars are never traded
+(their fills would be at prices you could no longer get). The trend book's **band**, though,
+is moved through them before the newest bar is decided, on the same 3600-bar windows it would
+have used, without trading (`live/catchup.py`): its next target depends on every bar before
+it, so skipping them would leave it on a different path from the research until it resynced.
+Measured 2026-11-05 (ETH 1h book ticked hourly through 2026-03..06 but never 23:00-06:00 UTC):
+without this, 330 of 2057 awake decisions (16%) differed from the research; with it, none.
+The runner fetches the extra history this needs, up to 3600 bars back. The loss-limit baseline is the equity at 00:00 UTC even when the Mac slept
 through midnight: on the first mark of a new day the runner fetches the 23:55 bar and values
 the position held at midnight at its close (the last mark before midnight stands in if that
 bar is missing). A loss made between midnight and wake therefore counts against the day.
@@ -166,7 +173,7 @@ The default is `config/live_books.json` (the four books above). Entry shapes:
 
 ```json
 {
-  "cost_bps_per_side": 5.0, "poll_seconds": 30, "max_daily_loss": 0.05, "starting_equity": 1000,
+  "cost_bps_per_side": 5.0, "poll_seconds": 30, "max_daily_loss": 0, "starting_equity": 1000,
   "books": [
     {"book_id": "btc-trend-1h", "title": "BTC trend, vol-targeted (1h)", "strategy": "voltarget_trend",
      "symbol": "BTCUSDT", "timeframe": "1h", "params": {"config": "vt_1h_slow4_z_s30"}},
@@ -192,7 +199,9 @@ with fresh paper cash; renaming one starts over (the old book stays in the datab
 Changing an existing book's `symbol` or `timeframe` is refused: that book is skipped with a
 `config_conflict` event (its coins would otherwise be priced in the other market). Use a new
 `book_id` for the new setup. `"enabled": false` stops checking a book and the dashboard
-shows it as "Turned off".
+shows it as "Turned off". A book removed from books.json is turned off the same way on the next
+check (its history is kept, and the dashboard lists it after the active books); adding it back
+turns it on again.
 
 `demo_sma_trend` is **demo — not promoted**: long when the fast moving average of closes is
 above the slow one. It exists to exercise the runner, and the dashboard says so. It is no
@@ -216,9 +225,12 @@ rounds to 0 exits at once). Fractional targets: the book can hold, say, 35% BTC.
 
 * **State.** The band is path dependent. The runner passes the strategy its own last target
   from the `decisions` table (`Store.strategy_target`), and the strategy applies ONE step of
-  the band to the newest bar. It never re-runs the band over its window. A new book starts
-  flat, like the research did before its first signal; until the band first moves it can
-  hold a different amount than the research path that started in 2017 would.
+  the band to the newest bar. Bars the runner did not decide are stepped through first,
+  without trading (`live/catchup.py`, `STATE_BARS` = 3600). A new book runs the band over the
+  3600 bars before its first decision, starting flat, so it starts where the research path
+  (flat since 2017) is: measured 2026-11-05 at 100 random start bars per coin in
+  2025-01..2026-06, the first decision equalled the research target at all of them (a flat
+  start had disagreed at 72 of 200 BTC and 79 of 200 ETH starts, for up to 3160 bars).
 * **Warm-up: 3600 bars (150 days).** The EWMA vol has infinite memory. Measured 2026-11-05 on
   the cached 1h bars (300 random bars per symbol), the worst relative difference between a
   window's raw exposure and the full-history one was 1.5e-09 at 2400 bars, 6e-10 at 2600,
@@ -230,6 +242,8 @@ rounds to 0 exits at once). Fractional targets: the book can hold, say, 35% BTC.
   bar starting flat with no research state (2017-09..2019-12); and
   `test_live_runner_trend.py` runs the book through `tick()` hourly on cached bars and gets
   the same fills, prices and targets as `run_backtest`, costs and equity to 1e-9.
+  `test_live_band_catchup.py` ticks it with the Mac asleep every night and offline for four
+  days and gets the research band on every decided bar, and checks a new book's first decision.
 
 ### LightGBM 4h, `lgbm`
 
@@ -263,7 +277,8 @@ bar and held its position across it.
   October bar uses October's model even after November's exists. The dashboard shows the
   newest folder's version.
 * **Refusals.** A book refuses to decide, keeps its position and says why on its card ("Not
-  deciding") and in the events when there is no artifact, the model file does not match its
+  deciding") and in the events when there is no artifact, the `metadata.json` lacks a value the
+  book reads, the model file does not match its
   SHA256, the installed library versions differ from the recorded ones, or the model for the
   bar's month is not trained yet. It never decides a new month's bar with last month's
   model: the bar waits, unclaimed, and is decided as soon as the model exists (normally
@@ -275,17 +290,20 @@ bar and held its position across it.
   each LightGBM book, trains the current month's model unless a usable one exists. If
   training fails, nothing is published, the book makes no decisions for the new month and
   keeps its position (it never falls back to last month's model), an event says so (at most
-  once a day) and the next hourly run tries again; the full error is in `retrain.jsonl`. If no threshold made money (the research would trade flat
-  that month), the previous model stays in use for the month, a marker file
-  (`.no-threshold-<YYYY-MM>.json` next to the model folders) stops later runs from training
-  it again, and an event says so. The month is judged on this Mac's clock, in UTC.
+  once a day) and the next hourly run tries again; the full error is in `retrain.jsonl`. If no
+  threshold made money, the book stays in cash for that month, as the research did, and needs
+  no model for it (so an earlier model that can no longer be used does not stop it). A marker
+  file (`.no-threshold-<YYYY-MM>.json` next to the model folders, with the library versions)
+  stops later runs from training the month again until those versions change, and an event
+  says so. The month is judged on this Mac's clock, in UTC.
 * **Warm-up: 3000 bars (500 days).** `emadist_180` is an EWM with infinite memory. Measured
   2026-11-05 (150 random bars per symbol): worst relative feature difference 1.7e-07 at 2000
   bars, 1.3e-09 at 2500, 5e-10 at 3000 (there a rolling-sum rounding difference, not the EWM).
 * **Parity** (`test_live_lgbm_parity.py`): the real `train` command for 2026-06 on the cached
   bars gives the research fold's threshold bitwise and, through the saved text model, the
   research model's probabilities bitwise; the live book's decision on every June 2026 4h bar,
-  computed from a 3000-bar window, equals the research target, with the same probability.
+  computed from a 3000-bar window, equals the research target, with the same probability; and
+  so does every June decision of the book ticked through `tick()` every 4h.
 
 ### Comparing with buy and hold
 
@@ -296,7 +314,9 @@ dashed line on the chart.
 
 ### Fetching history
 
-The trend books need 150 days of 5m bars and the LightGBM books 500 days (both coins). The
+The trend books need 150 days of 5m bars (300 days for a new book's first decision, to run
+its band over the 3600 bars before it, and up to that after a long absence) and the LightGBM
+books 500 days (both coins), so with the default books the LightGBM span covers both. The
 first check after the runner starts downloads that from Binance (about 150 requests of 1000
 bars per coin; the first `tick` of all four books took 2 min 7 s on 2026-11-05); after that
 the in-memory cache keeps the widest span any book asked for and only the newest bars are
@@ -339,20 +359,22 @@ backtest of the live code path.
 ## Known limitations
 
 * The research books differ from their backtests where the runner differs from the
-  research: a new trend book starts flat; bars missed while the Mac sleeps are not replayed,
-  so the band can follow a different path afterwards; the daily loss limit (5 %, on by
-  default) can force a sale the backtest never made (the trend strategy keeps its own state
-  through the pause and the book returns to it the next bar); a LightGBM month with no
-  profitable threshold keeps last month's model where the research stayed in cash.
+  research: bars missed while the Mac sleeps are not traded (the trend band is kept on the
+  research path, but the book's fills wait for wake); a new trend book's band starts from
+  3600 bars of history, not from 2017 (it agreed with the research at every start measured);
+  and a daily loss limit, if you turn one on, can force a sale the backtest never made (the
+  trend strategy keeps its own state through the pause and the book returns to it the next
+  bar). If your `books.json` in the app folder was copied from an earlier default it may
+  still say `"max_daily_loss": 0.05`; set it to 0 to match the research.
 * A LightGBM book whose month's model is not trained when its first bar of the month closes
   (the Mac was off or asleep over 00:00-04:00 UTC on the 1st, or the download failed) keeps
   its position and skips the bars that close before the hourly retrain catches up, where the
   research traded them with the new model. Measured 2026-11-05: with the old 06:30-local
   schedule on US Pacific time, 5 of 33 (BTC) and 9 of 33 (ETH) of those first-three bars of
   2025-08..2026-06 would have been decided differently from the research.
-* If a month found no profitable threshold AND the earlier model it keeps cannot be used
-  (say after a library upgrade), `retrain` does not fix it (it would find no threshold
-  again): run `signal-desk-live train lgbm --symbol <SYMBOL> --month <earlier YYYY-MM>`.
+* A LightGBM book continues its own last target across a bar the other coin lacks. If the
+  bars before it were missed while the Mac slept, that target is the last one decided, not
+  the one the research reached on the missed bars (they are not replayed for this book).
 * A `signal-desk-live tick` from the command line downloads the full warm-up history every
   time (the cache lives only as long as the process).
 

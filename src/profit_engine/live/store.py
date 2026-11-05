@@ -220,6 +220,16 @@ class Store:
                 raise BookConflict(spec.book_id, tuple(have), (s.symbol, s.timeframe))
             c.execute(f"INSERT INTO books ({cols}) VALUES ({marks}) ON CONFLICT(book_id) DO UPDATE SET {update}", row)
 
+    def turn_off_unlisted(self, book_ids: list[str], now: pd.Timestamp) -> int:
+        """Mark every book missing from the settings as turned off (its history is kept; listing
+        it again turns it back on). Returns how many were turned off."""
+        marks = ", ".join("?" for _ in book_ids)
+        with self.tx() as c:
+            return c.execute(
+                f"UPDATE books SET enabled=0, updated_at=? WHERE enabled=1 AND book_id NOT IN ({marks})",
+                (iso(now), *book_ids),
+            ).rowcount
+
     def book(self, book_id: str, conn: sqlite3.Connection | None = None) -> dict | None:
         row = (conn or self.conn).execute("SELECT * FROM books WHERE book_id=?", (book_id,)).fetchone()
         return dict(row) if row else None

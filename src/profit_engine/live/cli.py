@@ -102,8 +102,8 @@ def cmd_train(args: argparse.Namespace) -> int:
         frames = training.load_5m(data_dir, sync=not args.no_sync, now=now)
         folder = training.train_and_publish(frames, args.symbol, cutoff, paths.models_dir(), args.config)
     except training.art.NoThreshold:
-        print("No threshold made money in training, so no model was saved (the backtest would stay in cash). "
-              "Any earlier model is kept.", file=sys.stderr)  # fmt: skip
+        print(f"No setting made money in training, so no model was saved and the book stays in cash for "
+              f"{cutoff:%B %Y}, as the backtest did.", file=sys.stderr)  # fmt: skip
         return 1
     except training.DataNotReady as exc:
         print(f"The price history is not complete yet ({exc}). Nothing was saved; try again later.", file=sys.stderr)

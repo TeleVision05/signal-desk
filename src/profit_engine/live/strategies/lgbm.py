@@ -10,8 +10,8 @@ Which model. The research decides every bar OPENING in month M (UTC) with fold M
 of a month whose model is not trained yet is NOT decided with last month's model: ``decide``
 raises :class:`StrategyUnavailable` (the book keeps its position, the bar stays unclaimed and
 is decided as soon as ``retrain`` publishes the model; the retrain job runs every hour). A
-month whose training found no profitable threshold keeps the previous model (documented in
-docs/live_runner.md, Known limitations; the research stayed in cash).
+month whose training found no profitable threshold (a marker file, see
+:func:`lgbm_artifacts.has_no_threshold`) is decided flat, as the research did, and needs no model.
 
 A bar the other coin lacks. The research builds features on the bars both coins have
 (``features.align``), so such a bar is not in its target or backtest at all and the research
@@ -26,6 +26,7 @@ If no usable artifact exists (never trained, altered, or trained under other lib
 versions), the book keeps its position: ``problem`` says why in plain words (the runner
 raises it as :class:`StrategyUnavailable`) and ``problem_detail`` keeps the technical detail
 for the log, until ``signal-desk-live train lgbm`` or ``retrain`` produces a usable one.
+``problem`` stays empty while the current month is a no-threshold month: those bars need no model.
 """
 
 from __future__ import annotations
@@ -62,7 +63,9 @@ class LgbmStrategy:
     name = "lgbm"
     stateful = True  # a bar the other coin lacks keeps the book's own last target
 
-    def __init__(self, symbol: str, timeframe: str = "4h", config: str = DEFAULT_CONFIG, models_dir=None) -> None:
+    def __init__(
+        self, symbol: str, timeframe: str = "4h", config: str = DEFAULT_CONFIG, models_dir=None, now=None
+    ) -> None:  # fmt: skip
         if config not in core.CONFIGS:
             raise ValueError(f"unknown lgbm config {config!r}; known: {sorted(core.CONFIGS)}")
         if timeframe != core.CONFIGS[config]["tf"]:
@@ -73,17 +76,25 @@ class LgbmStrategy:
         self.other_symbol = art.OTHER[symbol]
         self.warmup_bars = art.WARMUP_BARS[config]
         self.models_dir = Path(models_dir or paths.models_dir())
-        self.loaded, self.problem, self.problem_detail = None, "", ""
+        self.loaded, self.unavailable, self.problem_detail = None, "", ""
         try:
             self.loaded = art.load_latest(self.models_dir, config, symbol)
         except FileNotFoundError:
-            self.problem = (
+            self.unavailable = (
                 f"No trained {_coin(symbol)} LightGBM model yet, so the book stays as it is. "
                 f"Run: signal-desk-live train lgbm --symbol {symbol}"
             )
         except (ArtifactError, ValueError, OSError) as exc:
-            self.problem, self.problem_detail = self._unusable(exc), str(exc)
+            self.unavailable, self.problem_detail = self._unusable(exc), str(exc)
+        month = f"{art.month_start(pd.Timestamp(now) if now is not None else pd.Timestamp.now(tz='UTC')):%Y-%m}"
+        self.problem = "" if self._flat(month) else self.unavailable  # shown before any bar is fetched
         self.meta = self._meta()
+
+    def _flat(self, month: str) -> bool:
+        """``month`` found no profitable threshold: decided flat, no model needed."""
+        if art.folder_for_month(self.models_dir, self.config, self.symbol, month) is not None:
+            return False
+        return art.has_no_threshold(self.models_dir, self.config, self.symbol, month)
 
     def _unusable(self, exc: Exception) -> str:
         reason = getattr(exc, "reason", art.INCOMPLETE_REASON)
@@ -104,11 +115,14 @@ class LgbmStrategy:
             promoted=False, source=f"model:{self.loaded.folder.name}", status=STATUS, family=FAMILY,
         )  # fmt: skip
 
-    def model_for(self, bar_open: pd.Timestamp) -> art.Loaded:
-        """The artifact for the month ``bar_open`` falls in (UTC); StrategyUnavailable if none is usable."""
-        if self.loaded is None:
-            raise StrategyUnavailable(self.problem)
+    def model_for(self, bar_open: pd.Timestamp) -> art.Loaded | None:
+        """The artifact for the month ``bar_open`` falls in (UTC), None for a no-threshold month
+        (flat); StrategyUnavailable if there is no usable one."""
         month = f"{art.month_start(bar_open):%Y-%m}"
+        if self._flat(month):
+            return None
+        if self.loaded is None:
+            raise StrategyUnavailable(self.unavailable)
         folder = art.folder_for_month(self.models_dir, self.config, self.symbol, month)
         if folder is None:
             raise StrategyUnavailable(
@@ -135,27 +149,31 @@ class LgbmStrategy:
 
     def decide(self, bars: pd.DataFrame, other: pd.DataFrame | None = None, prev_target: float = 0.0) -> Decision:
         model = self.model_for(bars.index[-1])
-        coin, m = _coin(self.symbol), model.meta
-        thr, month = float(m["threshold"]), m["trades_month"]
-        details = {"threshold": thr, "model": m["version"]}
+        coin, bar_month = _coin(self.symbol), f"{art.month_start(bars.index[-1]):%Y-%m}"
+        if model is None:
+            details = {"flat_month": True}
+        else:
+            details = {"threshold": float(model.meta["threshold"]), "model": model.meta["version"]}
         if other is None or bars.index[-1] not in other.index:  # research: no such bar, position held
             text = (
                 f"There is no closed {_coin(self.other_symbol)} bar for this bar, so the model cannot score it and "
                 f"the book keeps its position ({prev_target:.0%} in {coin}), as the backtest did."
             )
             return Decision(float(prev_target), text, {**details, "no_matching_bar": True})
+        if model is None:
+            text = (
+                f"Training for {_month_name(bar_month)} found no setting that made money, so the book stays in "
+                f"cash this month, as the backtest did."
+            )
+            return Decision(0.0, text, details)
         p = self.probability(model, bars, other)
         if p is None:
             text = "Some model inputs for this bar are missing (too little history), so the book stays in cash, "
             return Decision(0.0, text + "as the backtest did.", details)
-        up = bool(np.float64(p) > thr)
-        bar_month = f"{art.month_start(bars.index[-1]):%Y-%m}"
-        kept = "" if bar_month == month else (
-            f" Training for {_month_name(bar_month)} found no setting that made money, so it keeps this model."
-        )  # fmt: skip
+        up = bool(np.float64(p) > details["threshold"])
         text = (
-            f"The model (trained for {month}) puts the chance that {coin} rises enough over the next "
-            f"few days at {p:.0%}; it needs more than {thr:.0%}, so the book "
-            f"{'holds ' + coin if up else 'stays in cash'}.{kept}"
+            f"The model (trained for {model.meta['trades_month']}) puts the chance that {coin} rises enough over the "
+            f"next few days at {p:.0%}; it needs more than {details['threshold']:.0%}, so the book "
+            f"{'holds ' + coin if up else 'stays in cash'}."
         )
         return Decision(1.0 if up else 0.0, text, {**details, "p_up": p})

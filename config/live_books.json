@@ -2,7 +2,7 @@
   "cost_bps_per_side": 5.0,
   "poll_seconds": 30,
   "jitter": 0.1,
-  "max_daily_loss": 0.05,
+  "max_daily_loss": 0,
   "stale_after_bars": 2,
   "max_price_jump": 0.25,
   "settle_seconds": 2,

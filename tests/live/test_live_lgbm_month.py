@@ -55,19 +55,61 @@ def test_each_bar_is_decided_by_the_model_for_the_month_it_opens_in(tmp_path):
     assert d.details["model"] == nov.name and s.meta.version == nov.name and "2026-11" in d.explanation
 
 
-def test_a_month_without_a_profitable_threshold_keeps_the_previous_model(tmp_path, monkeypatch):
-    """Documented live behaviour (Known limitations): the research stays in cash that month."""
-    oct_ = _publish(tmp_path, "BTCUSDT", "2026-10", "2026-10-01 07:00")
+def _flat_november(models, monkeypatch):
+    """Training for November 2026 finds no threshold (the research is flat all month)."""
 
     def no_threshold(*_a, **_k):
         raise art.NoThreshold("flat")
 
     monkeypatch.setattr(training.art, "train", no_threshold)
     with pytest.raises(art.NoThreshold):
-        training.train_and_publish(frames_5m("2026-11-01 01:00"), "BTCUSDT", T("2026-11-01"), tmp_path)
+        training.train_and_publish(frames_5m("2026-11-01 01:00"), "BTCUSDT", T("2026-11-01"), models)
+
+
+def test_a_month_without_a_profitable_threshold_is_decided_flat_as_the_research_did(tmp_path, monkeypatch):
+    oct_ = _publish(tmp_path, "BTCUSDT", "2026-10", "2026-10-01 07:00")
+    _flat_november(tmp_path, monkeypatch)
+    s = LgbmStrategy("BTCUSDT", models_dir=tmp_path, now=T("2026-11-05"))
     b = dated_4h("2026-11-01 00:00")
-    d = LgbmStrategy("BTCUSDT", models_dir=tmp_path).decide(b["BTCUSDT"], b["ETHUSDT"])
-    assert d.details["model"] == oct_.name and "found no setting that made money" in d.explanation
+    d = s.decide(b["BTCUSDT"], b["ETHUSDT"])
+    assert d.target == 0.0 and d.details["flat_month"] and "stays in cash" in d.explanation
+    assert "November 2026" in d.explanation and "as the backtest did" in d.explanation
+    late = dated_4h("2026-10-31 20:00")  # an October bar is still decided by October's model
+    assert s.decide(late["BTCUSDT"], late["ETHUSDT"]).details["model"] == oct_.name
+    for prev in (0.0, 1.0):  # a bar the other coin lacks still holds, as the research did
+        assert call_decide(s, b["BTCUSDT"], b["ETHUSDT"].iloc[:-1], prev).target == prev
+
+
+@pytest.mark.parametrize("earlier", ["unusable", "none"])
+def test_a_flat_month_needs_no_model_so_an_unusable_or_missing_one_does_not_stop_the_book(tmp_path, earlier):
+    """Before: the book kept the earlier model, so when that one could not be used (say after a
+    library upgrade) it stopped for the month and told the user to run a retrain that did nothing."""
+    if earlier == "unusable":
+        _break(_publish(tmp_path, "BTCUSDT", "2026-10", "2026-10-01 07:00"), "versions")
+    art.mark_no_threshold(tmp_path, CONFIG, "BTCUSDT", "2026-11", T("2026-11-01 00:10"))
+    s = LgbmStrategy("BTCUSDT", models_dir=tmp_path, now=T("2026-11-05"))
+    assert s.problem == ""
+    b = dated_4h("2026-11-01 00:00")
+    assert s.decide(b["BTCUSDT"], b["ETHUSDT"]).target == 0.0
+    late = dated_4h("2026-10-31 20:00")  # October still needs October's model
+    with pytest.raises(StrategyUnavailable):
+        s.decide(late["BTCUSDT"], late["ETHUSDT"])
+    assert LgbmStrategy("BTCUSDT", models_dir=tmp_path, now=T("2026-10-20")).problem  # no flat month: still said
+
+
+def test_a_no_threshold_marker_from_other_library_versions_is_trained_again(monkeypatch):
+    """Like a model, a "no threshold" result holds only for the library versions it was found with."""
+    models = paths.models_dir()
+    for s in art.OTHER:
+        art.mark_no_threshold(models, CONFIG, s, "2026-11", T("2026-11-01 00:10"))
+        marker = art.symbol_dir(models, CONFIG, s) / ".no-threshold-2026-11.json"
+        old = json.loads(marker.read_text())
+        old["versions"]["lightgbm"] = "3.0.0"
+        marker.write_text(json.dumps(old))
+    assert not training.month_ready(models, CONFIG, "BTCUSDT", T("2026-11-01"))
+    monkeypatch.setattr(training, "load_5m", lambda *a, **k: frames_5m("2026-11-05"))
+    monkeypatch.setattr(training.art, "train", lambda f, s, cut, c: fake_trained(s, f"{cut:%Y-%m}"))
+    assert [r["status"] for r in training.retrain(now=T("2026-11-05 07:00"))] == ["trained", "trained"]
 
 
 def _first_fire_after(start_utc: pd.Timestamp, tz: str, entries: list[dict]) -> pd.Timestamp:
@@ -98,7 +140,7 @@ def test_retrain_that_finds_no_threshold_is_not_repeated_every_hour(monkeypatch)
     monkeypatch.setattr(training, "load_5m", lambda *a, **k: frames_5m("2026-11-05"))
     monkeypatch.setattr(training.art, "train", no_threshold)
     now = T("2026-11-01 00:10")
-    assert {r["status"] for r in training.retrain(now=now)} == {"kept_old"}
+    assert {r["status"] for r in training.retrain(now=now)} == {"flat_month"}
     assert {r["status"] for r in training.retrain(now=now + pd.Timedelta("1h"))} == {"up_to_date"}
     assert sorted(calls) == ["BTCUSDT", "ETHUSDT"]
 

@@ -121,8 +121,9 @@ def heartbeat(conn: sqlite3.Connection, now: pd.Timestamp | None = None) -> dict
 
 def overview(path: Path) -> dict:
     with closing(connect_ro(path)) as conn:
-        # Grouped by strategy for the dashboard (DESC puts "Trend (vol-targeted)" before "LightGBM 4h").
-        books = _rows(conn, "SELECT * FROM books ORDER BY family DESC, book_id")
+        # Grouped by strategy for the dashboard (DESC puts "Trend (vol-targeted)" before "LightGBM 4h");
+        # books turned off (or no longer in the settings) come after the active ones.
+        books = _rows(conn, "SELECT * FROM books ORDER BY enabled DESC, family DESC, book_id")
         return {
             "paper": True,
             "server_time": pd.Timestamp.now(tz="UTC").isoformat(),

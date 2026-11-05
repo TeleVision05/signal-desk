@@ -67,7 +67,7 @@ def test_a_book_without_a_model_keeps_its_position_and_says_why(store, quiet):
 
 
 @pytest.mark.parametrize(
-    ("failure", "status"), [(art.NoThreshold("flat"), "kept_old"), (RuntimeError("boom"), "failed")]
+    ("failure", "status"), [(art.NoThreshold("flat"), "flat_month"), (RuntimeError("boom"), "failed")]
 )
 def test_retrain_keeps_the_old_model_when_training_fails_or_finds_no_threshold(monkeypatch, failure, status):
     models = paths.models_dir()
@@ -113,7 +113,7 @@ def _events() -> list[dict]:
 
 
 def test_training_that_finds_no_threshold_publishes_nothing(monkeypatch, tmp_path):
-    """Research trades flat in such a month; live keeps the previous model instead (never a new flat one)."""
+    """Research trades flat in such a month; so does live, from a marker file (no model is published)."""
     frames = {s: make_5m(12 * 24 * 400, seed=i, vol=0.003, start="2017-09-01") for i, s in enumerate(art.OTHER)}
     cutoff = pd.Timestamp("2018-10-01", tz="UTC")
     seen = {}
@@ -127,3 +127,30 @@ def test_training_that_finds_no_threshold_publishes_nothing(monkeypatch, tmp_pat
         training.train_and_publish(frames, "BTCUSDT", cutoff, tmp_path)
     assert seen["cutoff"] == cutoff and seen["rows"] > 1000
     assert art.versions(tmp_path, CONFIG, "BTCUSDT") == [] and not any(tmp_path.rglob("model.txt"))
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("threshold", None), ("trades_month", None), ("train_window", None), ("version", None),
+     ("feature_columns", None), ("threshold", "high"), ("threshold", float("nan"))],
+)  # fmt: skip
+def test_metadata_missing_a_key_stops_only_that_book_and_retrain_repairs_it(monkeypatch, key, value):
+    """A metadata.json that parses but lacks a key the book reads is an unusable artifact, like an
+    unreadable one: it must not stop the other books or the retrain job."""
+    models = paths.models_dir()
+    for s in art.OTHER:
+        folder = art.publish(fake_trained(s, "2026-11"), models, pd.Timestamp("2026-11-01 00:10", tz="UTC"))
+        if s == "BTCUSDT":
+            meta = json.loads((folder / "metadata.json").read_text())
+            meta.pop(key) if value is None else meta.update({key: value})
+            (folder / "metadata.json").write_text(json.dumps(meta))
+    cfg = training.load_config()  # the four default books: must still load
+    books = {b.book_id: b.strategy for b in cfg.books}
+    assert "some of its files are missing or unreadable" in books["btc-lgbm-4h"].problem
+    assert books["eth-lgbm-4h"].problem == "" and "btc-trend-1h" in books and "eth-trend-1h" in books
+    assert [(c, s) for c, s, _ in training.lgbm_targets()] == [(CONFIG, "BTCUSDT"), (CONFIG, "ETHUSDT")]
+    monkeypatch.setattr(training, "load_5m", lambda *a, **k: frames_5m("2026-11-05"))
+    monkeypatch.setattr(training.art, "train", lambda f, s, cut, c: fake_trained(s, f"{cut:%Y-%m}"))
+    results = training.retrain(now=pd.Timestamp("2026-11-05 07:00", tz="UTC"))
+    assert [r["status"] for r in results] == ["trained", "up_to_date"]
+    assert LgbmStrategy("BTCUSDT").problem == ""

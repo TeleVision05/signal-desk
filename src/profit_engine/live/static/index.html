@@ -85,7 +85,7 @@ const KIND = { catch_up: "Caught up after a pause", gap: "Missing data", stale_d
   kill_switch: "Daily loss stop", resumed: "Trading again", data_error: "Connection problem",
   bad_price: "Odd price, skipped", strategy_error: "Strategy problem", error: "Problem",
   clock_skew: "Clock check", config_error: "Settings problem", model_unavailable: "No usable model",
-  model_trained: "New model", model_kept_old: "Kept previous model", model_failed: "Retrain failed" };
+  model_trained: "New model", model_kept_old: "Kept previous model", model_flat_month: "In cash this month", model_failed: "Retrain failed" };
 const GROUP_NOTE = { "Trend (vol-targeted)": "Not promoted. The best research candidate, being forward tested.",
   "LightGBM 4h": "Not promoted. A comparison model: its backtest trailed buy-and-hold." };
 const money = (x) => x == null ? "—" : "$" + Number(x).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });

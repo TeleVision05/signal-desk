@@ -184,3 +184,23 @@ def test_every_test_file_a_live_docstring_cites_exists():
     src = paths.REPO_ROOT / "src/profit_engine/live"
     cited = {m for f in src.rglob("*.py") for m in re.findall(r"tests/live/\w+\.py", f.read_text())}
     assert cited and all((paths.REPO_ROOT / c).exists() for c in cited), sorted(cited)
+
+
+def test_a_book_removed_from_the_settings_is_shown_as_turned_off_after_the_others(tmp_path, quiet):
+    """Someone who ran the earlier default (the demo books) and then the four research books must
+    not see the old demo book as an active card next to them."""
+    db = tmp_path / "live.sqlite"
+    store = Store(db)
+    demo, trend = Const(1.0), Const(0.5)
+    demo.meta = StrategyMeta("1", family="demo_sma_trend")
+    trend.meta = StrategyMeta("1", status="not promoted — best research candidate (forward test)", family="Trend")
+    src = FakeSource({"BTCUSDT": make_5m(400, seed=3)}, "2021-03-01 05:00:30+00:00")
+    tick(config(book(demo, book_id="btc-demo-4h")), store, src, quiet)
+    tick(config(book(trend, book_id="btc-trend-1h")), store, src, quiet)
+    ov = queries.overview(db)
+    assert [(b["book_id"], b["enabled"]) for b in ov["books"]] == [("btc-trend-1h", True), ("btc-demo-4h", False)]
+    tick(config(book(demo, book_id="btc-demo-4h"), book(trend, book_id="btc-trend-1h")), store, src, quiet)
+    assert {b["book_id"]: b["enabled"] for b in queries.overview(db)["books"]} == {
+        "btc-trend-1h": True, "btc-demo-4h": True,
+    }  # fmt: skip
+    store.close()
