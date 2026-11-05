@@ -30,6 +30,19 @@ def _age_s(ts: str | None, now: pd.Timestamp) -> float | None:
     return None if not ts else round((now - pd.Timestamp(ts)).total_seconds(), 1)
 
 
+def buy_and_hold(conn: sqlite3.Connection, book: dict, price: float | None) -> dict:
+    """What the starting cash would be worth had it bought the coin at the book's first marked
+    price and held it (before fees): the reference the dashboard compares each book with."""
+    first = conn.execute(
+        "SELECT ts, price FROM equity_marks WHERE book_id=? ORDER BY ts LIMIT 1", (book["book_id"],)
+    ).fetchone()
+    if first is None or not price or not first["price"]:
+        return {"bh_start_ts": None, "bh_start_price": None, "bh_equity": None, "bh_return_pct": None}
+    value = book["starting_equity"] * price / first["price"]
+    pct = (value / book["starting_equity"] - 1) * 100 if book["starting_equity"] else 0.0
+    return {"bh_start_ts": first["ts"], "bh_start_price": first["price"], "bh_equity": value, "bh_return_pct": pct}
+
+
 def book_summary(conn: sqlite3.Connection, book: dict) -> dict:
     bid = book["book_id"]
     mark = conn.execute("SELECT * FROM equity_marks WHERE book_id=? ORDER BY ts DESC LIMIT 1", (bid,)).fetchone()
@@ -53,7 +66,8 @@ def book_summary(conn: sqlite3.Connection, book: dict) -> dict:
         "params": json.loads(book["params_json"] or "{}"),
         "artifact_hash": book["artifact_hash"],
         "promoted": bool(book["promoted"]),
-        "label": PROMOTED_LABEL if book["promoted"] else DEMO_LABEL,
+        "label": PROMOTED_LABEL if book["promoted"] else (book.get("status_label") or DEMO_LABEL),
+        "family": book.get("family") or book["strategy"],
         "enabled": bool(book["enabled"]),
         "starting_equity": book["starting_equity"],
         "equity": equity,
@@ -67,6 +81,7 @@ def book_summary(conn: sqlite3.Connection, book: dict) -> dict:
         "last_bar_ts": book["last_bar_ts"],
         "paused_until": book["paused_until"],
         "last_decision": dict(decision) if decision else None,
+        **buy_and_hold(conn, book, price),
     }
 
 
@@ -85,7 +100,8 @@ def heartbeat(conn: sqlite3.Connection, now: pd.Timestamp | None = None) -> dict
 
 def overview(path: Path) -> dict:
     with closing(connect_ro(path)) as conn:
-        books = _rows(conn, "SELECT * FROM books ORDER BY book_id")
+        # Grouped by strategy for the dashboard (DESC puts "Trend (vol-targeted)" before "LightGBM 4h").
+        books = _rows(conn, "SELECT * FROM books ORDER BY family DESC, book_id")
         return {
             "paper": True,
             "server_time": pd.Timestamp.now(tz="UTC").isoformat(),

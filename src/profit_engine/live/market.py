@@ -5,8 +5,11 @@ exchange's clock. The runner (not the source) decides what is closed, against th
 exchange's time, so a fast or slow Mac clock cannot make an unfinished bar look closed.
 
 The Binance source reuses the harness plumbing by importing it
-(``intraday.binance.fetch_rest`` and ``intraday.data.normalize_raw``) and keeps a small
-in-memory cache so a 30-second loop re-downloads only the newest bars.
+(``intraday.binance.fetch_rest`` and ``intraday.data.normalize_raw``) and keeps an in-memory
+cache so a 30-second loop re-downloads only the newest bars. The cache keeps the widest span
+any book has asked for (at least :data:`CACHE_SPAN`): the trend and LightGBM books need 150
+and 500 days of 5m history, which is fetched once per process and then only topped up. A
+request older than the cache fetches just the missing older bars.
 """
 
 from __future__ import annotations
@@ -64,6 +67,7 @@ class BinanceBarSource:
         self.session = session or requests.Session()
         self.retries, self.timeout, self.stop = retries, timeout, stop
         self._cache: dict[str, pd.DataFrame] = {}
+        self._span: dict[str, pd.Timedelta] = {}  # widest lookback asked for, per symbol
 
     def _stopping(self) -> bool:
         return self.stop is not None and self.stop.is_set()
@@ -93,10 +97,11 @@ class BinanceBarSource:
 
         return self._with_retries(call)
 
-    def _fetch(self, symbol: str, start: pd.Timestamp) -> pd.DataFrame:
+    def _fetch(self, symbol: str, start: pd.Timestamp, end: pd.Timestamp | None = None) -> pd.DataFrame:
         def call() -> pd.DataFrame:
             start_ms = int(start.value // 1_000_000)
-            raw = binance.fetch_rest(symbol, "5m", start_ms, self.session, timeout=self.timeout)
+            end_ms = None if end is None else int(end.value // 1_000_000)
+            raw = binance.fetch_rest(symbol, "5m", start_ms, self.session, end_ms=end_ms, timeout=self.timeout)
             if raw.empty:
                 return pd.DataFrame(columns=list(KLINE_COLUMNS), index=pd.DatetimeIndex([], tz="UTC"))
             frame, _ = normalize_raw(raw, now=KEEP_ALL)  # split_closed() decides what is closed later
@@ -106,14 +111,18 @@ class BinanceBarSource:
 
     def klines_5m(self, symbol: str, start: pd.Timestamp) -> pd.DataFrame:
         cached = self._cache.get(symbol)
-        if cached is None or cached.empty or cached.index[0] > start:
+        if cached is None or cached.empty:
             frame = self._fetch(symbol, start)
         else:
-            # Re-fetch from just before the newest cached bar: it may have been in progress last
-            # time, and the bar before it may have closed only moments before that fetch.
+            # Older bars than the cache holds: fetch only those. Then re-fetch from just before the
+            # newest cached bar: it may have been in progress last time, and the bar before it may
+            # have closed only moments before that fetch.
+            older = [self._fetch(symbol, start, end=cached.index[0])] if cached.index[0] > start else []
             fresh = self._fetch(symbol, cached.index[max(len(cached) - 1 - REFETCH_BARS, 0)])
-            frame = pd.concat([cached, fresh])
+            frame = pd.concat([*older, cached, fresh])
             frame = frame[~frame.index.duplicated(keep="last")].sort_index()
         if not frame.empty:
-            self._cache[symbol] = frame[frame.index >= frame.index[-1] - CACHE_SPAN]
+            span = max(self._span.get(symbol, CACHE_SPAN), frame.index[-1] - start)
+            self._span[symbol] = span
+            self._cache[symbol] = frame[frame.index >= frame.index[-1] - span]
         return frame[frame.index >= start]

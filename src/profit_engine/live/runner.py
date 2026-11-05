@@ -45,14 +45,22 @@ from profit_engine.live.market import FIVE_MIN, BarSource, DataUnavailable, spli
 from profit_engine.live.notify import Notifier
 from profit_engine.live.registry import BookSpec, LiveConfig, Settings
 from profit_engine.live.store import BarCommit, BookConflict, EventSpec, Store, iso, parse_ts
-from profit_engine.live.strategy import Decision, InvalidTarget, decision_window, normalize_decision, other_window
+from profit_engine.live.strategy import (
+    Decision,
+    InvalidTarget,
+    StrategyUnavailable,
+    call_decide,
+    decision_window,
+    normalize_decision,
+    other_window,
+)
 
 log = logging.getLogger("signal_desk.runner")
 MARK_LOOKBACK = pd.Timedelta("30min")
 MARK_JUMP_WINDOW = pd.Timedelta("1h")
 SKEW_WARN_S = 60.0
 MAX_WIDEN = 3  # history is doubled at most this many times to find warmup_bars complete bars
-UNHEALTHY = {"stale_data"}  # statuses that make the runner heartbeat "degraded" (the feed is not live)
+UNHEALTHY = {"stale_data", "model_unavailable"}  # statuses that make the runner heartbeat "degraded"
 
 
 @dataclass
@@ -109,7 +117,7 @@ def closed_bars(
         frame, _, bars = _resampled(ctx, spec, symbol, since)
         return frame, bars
     n = max(int(spec.strategy.warmup_bars), 1)
-    span, first = n + 4, None
+    span, first = n + max(4, n // 50), None  # a 2% margin absorbs the odd gap without a doubling
     for _ in range(MAX_WIDEN + 1):
         since = ctx.now.floor(spec.tf) - spec.tf * span
         frame, closed, bars = _resampled(ctx, spec, symbol, since)
@@ -159,11 +167,13 @@ def _is_stale(ctx: TickContext, spec: BookSpec, latest: pd.Timestamp) -> bool:
 
 
 def _run_strategy(ctx: TickContext, spec: BookSpec, window: pd.DataFrame) -> Decision:
+    """Decide on ``window``; a stateful strategy continues from its own last persisted target."""
     other = None
     if spec.strategy.other_symbol:
         _, other_bars = closed_bars(ctx, spec, spec.strategy.other_symbol, since=window.index[0])
         other = other_window(other_bars, window)
-    return normalize_decision(spec.strategy.decide(window, other))
+    prev = ctx.store.strategy_target(spec.book_id) if getattr(spec.strategy, "stateful", False) else 0.0
+    return normalize_decision(call_decide(spec.strategy, window, other, prev))
 
 
 def _catch_up(spec: BookSpec, skipped: int, latest: pd.Timestamp) -> tuple[EventSpec, ...]:
@@ -278,10 +288,16 @@ def decide_book(ctx: TickContext, spec: BookSpec, book: dict) -> str:
     same transaction, so a pause set by another process a moment ago is never missed."""
     last = parse_ts(book["last_bar_ts"])
     try:
+        if getattr(spec.strategy, "problem", ""):  # e.g. no trained model: say so before fetching history
+            raise StrategyUnavailable(spec.strategy.problem)
         bar = ready_bar(ctx, spec, last)
+        decision = _run_strategy(ctx, spec, bar.window)
     except _Skip as skip:
         return skip.status
-    decision = _run_strategy(ctx, spec, bar.window)
+    except StrategyUnavailable as exc:
+        log.warning("strategy unavailable", extra={"book_id": spec.book_id, "error": str(exc)})
+        ctx.event(spec.book_id, "model_unavailable", str(exc), key=_bucket(ctx.now, 60))
+        return "model_unavailable"
     commit = ctx.store.commit_bar(
         spec.book_id,
         BarCommit(bar.latest, bar.fill_ts, decision, bar.price, bar.close, spec.cost_bps_per_side, ctx.now,

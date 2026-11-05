@@ -1,9 +1,12 @@
-"""launchd integration: write, load and remove the two Signal Desk Live agents.
+"""launchd integration: write, load and remove the Signal Desk Live agents.
 
 * ``com.signaldesk.live`` runs ``signal-desk-live run`` (the paper-trading loop);
-* ``com.signaldesk.dashboard`` runs the localhost dashboard on 127.0.0.1:8765.
+* ``com.signaldesk.dashboard`` runs the localhost dashboard on 127.0.0.1:8765;
+* ``com.signaldesk.retrain`` runs ``signal-desk-live retrain`` at 06:30 local time on the 1st
+  and 2nd of each month (launchd runs a missed time on wake). Retraining is a no-op when the
+  month's LightGBM models exist, so the second date only catches a run missed on the first.
 
-Both are per-user LaunchAgents (``~/Library/LaunchAgents``), loaded with
+All are per-user LaunchAgents (``~/Library/LaunchAgents``), loaded with
 ``launchctl bootstrap gui/<uid>``: no sudo, nothing system-wide. ``RunAtLoad`` starts them at
 login, ``KeepAlive`` restarts them if they exit, ``ThrottleInterval`` spaces restarts.
 
@@ -39,6 +42,8 @@ from profit_engine.live import paths
 
 RUNNER_LABEL = "com.signaldesk.live"
 DASHBOARD_LABEL = "com.signaldesk.dashboard"
+RETRAIN_LABEL = "com.signaldesk.retrain"
+RETRAIN_TIMES = ({"Day": 1, "Hour": 6, "Minute": 30}, {"Day": 2, "Hour": 6, "Minute": 30})
 CAFFEINATE = "/usr/bin/caffeinate"
 # Copied into the agents' environment when set at install time. DATABASE_URL is deliberately
 # never forwarded: the live store is local SQLite only.
@@ -47,6 +52,7 @@ FORWARDED_ENV = (
     "SIGNAL_DESK_LIVE_DB",
     "SIGNAL_DESK_BOOKS",
     "SIGNAL_DESK_MODELS_DIR",
+    "SIGNAL_DESK_DATA_DIR",
     "SIGNAL_DESK_LOGS",
     "SIGNAL_DESK_NOTIFY",
 )
@@ -119,10 +125,20 @@ def dashboard_plist(plan: InstallPlan) -> dict:
     return _agent(plan, DASHBOARD_LABEL, ["dashboard"], [], "dashboard")
 
 
+def retrain_plist(plan: InstallPlan) -> dict:
+    """A scheduled job, not a service: it runs, exits, and waits for the next calendar time."""
+    plist = _agent(plan, RETRAIN_LABEL, ["retrain"], [], "retrain")
+    plist.pop("KeepAlive")
+    plist["RunAtLoad"] = False
+    plist["StartCalendarInterval"] = [dict(t) for t in RETRAIN_TIMES]
+    return plist
+
+
 def agents(plan: InstallPlan) -> list[tuple[str, dict]]:
     out = [(RUNNER_LABEL, runner_plist(plan))]
     if plan.dashboard:
         out.append((DASHBOARD_LABEL, dashboard_plist(plan)))
+    out.append((RETRAIN_LABEL, retrain_plist(plan)))
     return out
 
 
@@ -211,6 +227,9 @@ def install(
             failed += 1
         else:
             loaded.append(label)
+    if RETRAIN_LABEL in loaded:  # scheduled, so it is not running now: nothing to check
+        loaded.remove(RETRAIN_LABEL)
+        out(f"Scheduled {RETRAIN_LABEL}: retrains the LightGBM models on the 1st and 2nd of each month at 06:30.")
     if loaded:
         pause(STARTUP_CHECK_S)  # a blocked or broken agent exits within a second or two
         failed += sum(not _check_running(label, plan, uid, probe, out) for label in loaded)
@@ -223,8 +242,8 @@ def uninstall(
     plan: InstallPlan, dry_run: bool = False, run: Runner = _run, out: Callable[[str], None] = print,
     uid: int | None = None,
 ) -> int:  # fmt: skip
-    """Stop both agents and delete their plists (data and logs are kept)."""
+    """Stop the agents and delete their plists (data, models and logs are kept)."""
     uid = os.getuid() if uid is None else uid
-    for label in (RUNNER_LABEL, DASHBOARD_LABEL):
+    for label in (RUNNER_LABEL, DASHBOARD_LABEL, RETRAIN_LABEL):
         _retire(label, plan, dry_run, run, out, uid)
     return 0

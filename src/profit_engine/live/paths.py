@@ -8,8 +8,9 @@ runner must never write there, even when it is set in the shell).
 |---|---|---|
 | app folder | ``~/Library/Application Support/SignalDesk`` | ``SIGNAL_DESK_HOME`` |
 | live database | ``<app folder>/live.sqlite`` | ``SIGNAL_DESK_LIVE_DB`` |
-| books config | ``<app folder>/books.json``, else ``config/live_books.example.json`` | ``SIGNAL_DESK_BOOKS`` |
+| books config | ``<app folder>/books.json``, else ``config/live_books.json`` | ``SIGNAL_DESK_BOOKS`` |
 | model artifacts | ``<app folder>/models`` | ``SIGNAL_DESK_MODELS_DIR`` |
+| 5m history for training | ``<app folder>/market_data`` | ``SIGNAL_DESK_DATA_DIR`` |
 | logs | ``~/Library/Logs/SignalDesk`` | ``SIGNAL_DESK_LOGS`` |
 """
 
@@ -19,7 +20,7 @@ import os
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-EXAMPLE_BOOKS = REPO_ROOT / "config" / "live_books.example.json"
+DEFAULT_BOOKS = REPO_ROOT / "config" / "live_books.json"
 APP_NAME = "SignalDesk"
 
 
@@ -44,16 +45,26 @@ def db_path() -> Path:
 
 
 def books_path() -> Path:
-    """User config if present, else the repo example (demo books only)."""
+    """User config if present, else the repo default (the four research books)."""
     explicit = _env_path("SIGNAL_DESK_BOOKS")
     if explicit:
         return explicit
     user = app_dir() / "books.json"
-    return user if user.exists() else EXAMPLE_BOOKS
+    return user if user.exists() else DEFAULT_BOOKS
+
+
+def user_books_path() -> Path:
+    """Where ``install`` puts an editable copy of the default books."""
+    return app_dir() / "books.json"
 
 
 def models_dir() -> Path:
     return _env_path("SIGNAL_DESK_MODELS_DIR") or app_dir() / "models"
+
+
+def market_data_dir() -> Path:
+    """Closed 5m bars the LightGBM training reads (kept apart from the research cache)."""
+    return _env_path("SIGNAL_DESK_DATA_DIR") or app_dir() / "market_data"
 
 
 def logs_dir() -> Path:

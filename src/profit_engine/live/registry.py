@@ -1,8 +1,10 @@
-"""Load runner settings and books from ``books.json`` (see ``config/live_books.example.json``).
+"""Load runner settings and books from ``books.json`` (default: ``config/live_books.json``).
 
 Top-level keys are :class:`Settings` fields; ``books`` is a list of entries, each one of:
 
-* ``{"book_id", "strategy": "demo_sma_trend", "symbol", "timeframe", "params"}`` - a built-in
+* ``{"book_id", "strategy": "<built-in>", "symbol", "timeframe", "params"}`` - a built-in from
+  :data:`profit_engine.live.strategies.BUILTINS`: ``voltarget_trend`` (params ``config``),
+  ``lgbm`` (params ``config``; loads the newest trained artifact) or ``demo_sma_trend``
 * ``{"book_id", "strategy": "package.module:factory", "symbol", "timeframe", "params"}`` -
   ``factory(symbol=..., timeframe=..., **params)`` returns a Strategy
 * ``{"book_id", "model": "<folder under the models dir, or an absolute path>"}`` - a versioned
@@ -15,6 +17,7 @@ Optional per book: ``title``, ``enabled`` (default true), ``starting_equity``,
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
 import math
 import os
@@ -27,7 +30,8 @@ import pandas as pd
 from profit_engine.intraday.config import SYMBOLS, TIMEFRAMES
 from profit_engine.live import paths
 from profit_engine.live.models import load_model
-from profit_engine.live.strategy import BUILTINS, Strategy
+from profit_engine.live.strategies import BUILTINS
+from profit_engine.live.strategy import Strategy
 
 BOOK_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 
@@ -146,6 +150,8 @@ def build_strategy(entry: dict, models_dir: Path) -> Strategy:
     if factory is None:
         raise ConfigError(f"unknown strategy {name!r}; built-ins are {sorted(BUILTINS)}")
     where = {k: entry[k] for k in ("symbol", "timeframe") if entry.get(k)}
+    if "models_dir" in inspect.signature(factory).parameters:  # e.g. lgbm: newest artifact in the models folder
+        where["models_dir"] = models_dir
     try:
         return factory(**where, **(entry.get("params") or {}))
     except (TypeError, ValueError) as exc:

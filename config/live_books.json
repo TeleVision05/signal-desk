@@ -1,0 +1,54 @@
+{
+  "cost_bps_per_side": 5.0,
+  "poll_seconds": 30,
+  "jitter": 0.1,
+  "max_daily_loss": 0.05,
+  "stale_after_bars": 2,
+  "max_price_jump": 0.25,
+  "settle_seconds": 2,
+  "starting_equity": 1000,
+  "notifications": true,
+  "notify_min_interval_s": 300,
+  "books": [
+    {
+      "book_id": "btc-trend-1h",
+      "title": "BTC trend, vol-targeted (1h)",
+      "strategy": "voltarget_trend",
+      "symbol": "BTCUSDT",
+      "timeframe": "1h",
+      "params": {"config": "vt_1h_slow4_z_s30"},
+      "starting_equity": 1000,
+      "cost_bps_per_side": 5.0
+    },
+    {
+      "book_id": "eth-trend-1h",
+      "title": "ETH trend, vol-targeted (1h)",
+      "strategy": "voltarget_trend",
+      "symbol": "ETHUSDT",
+      "timeframe": "1h",
+      "params": {"config": "vt_1h_slow4_z_s30"},
+      "starting_equity": 1000,
+      "cost_bps_per_side": 5.0
+    },
+    {
+      "book_id": "btc-lgbm-4h",
+      "title": "BTC LightGBM (4h)",
+      "strategy": "lgbm",
+      "symbol": "BTCUSDT",
+      "timeframe": "4h",
+      "params": {"config": "lgbm_4h_h30_pt2_sl1"},
+      "starting_equity": 1000,
+      "cost_bps_per_side": 5.0
+    },
+    {
+      "book_id": "eth-lgbm-4h",
+      "title": "ETH LightGBM (4h)",
+      "strategy": "lgbm",
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "params": {"config": "lgbm_4h_h30_pt2_sl1"},
+      "starting_equity": 1000,
+      "cost_bps_per_side": 5.0
+    }
+  ]
+}

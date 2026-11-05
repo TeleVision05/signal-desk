@@ -18,6 +18,8 @@ from profit_engine.live import paths
 from profit_engine.live.models import ArtifactError
 from profit_engine.live.notify import Notifier, summarize
 from profit_engine.live.registry import ConfigError, load_config, parse_config
+from profit_engine.live.strategies.lgbm import LgbmStrategy
+from profit_engine.live.strategies.voltarget import VolTargetTrend
 from profit_engine.live.strategy import DEMO_LABEL, InvalidTarget, SmaTrendDemo, normalize_decision
 
 
@@ -26,13 +28,21 @@ def const_factory(meta: dict) -> Const:
     return Const(0.5, symbol=meta["symbol"], timeframe=meta["timeframe"])
 
 
-def test_example_config_loads_demo_books():
-    cfg = load_config(paths.EXAMPLE_BOOKS)
-    assert [b.symbol for b in cfg.books] == ["BTCUSDT", "ETHUSDT"]
-    assert cfg.settings.cost_bps_per_side == 5.0 and cfg.settings.max_daily_loss == 0.05
+def test_default_config_is_the_four_research_books_and_no_demo():
+    cfg = load_config()  # no user books.json in the isolated app folder: the repo default
+    assert cfg.source == paths.DEFAULT_BOOKS
+    ids = {b.book_id: b for b in cfg.books}
+    assert sorted(ids) == ["btc-lgbm-4h", "btc-trend-1h", "eth-lgbm-4h", "eth-trend-1h"]
     for b in cfg.books:
-        assert isinstance(b.strategy, SmaTrendDemo)
-        assert b.strategy.meta.label == DEMO_LABEL and not b.strategy.meta.promoted
+        assert b.starting_equity == 1000.0 and b.cost_bps_per_side == 5.0 and b.enabled
+        assert not isinstance(b.strategy, SmaTrendDemo) and not b.strategy.meta.promoted
+    trend, lgbm = ids["btc-trend-1h"].strategy, ids["eth-lgbm-4h"].strategy
+    assert isinstance(trend, VolTargetTrend) and trend.config == "vt_1h_slow4_z_s30" and trend.timeframe == "1h"
+    assert trend.meta.label == "not promoted — best research candidate (forward test)"
+    assert isinstance(lgbm, LgbmStrategy) and lgbm.config == "lgbm_4h_h30_pt2_sl1" and lgbm.timeframe == "4h"
+    assert lgbm.meta.label == "not promoted — comparison model (backtest trailed buy-and-hold)"
+    assert lgbm.other_symbol == "BTCUSDT" and "train lgbm --symbol ETHUSDT" in lgbm.problem  # no model trained here
+    assert DEMO_LABEL not in {b.strategy.meta.label for b in cfg.books}
 
 
 def test_bad_configs_are_rejected():

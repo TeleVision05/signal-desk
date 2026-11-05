@@ -1,13 +1,19 @@
-"""``signal-desk-live run|tick|status|dashboard|install|uninstall``."""
+"""``signal-desk-live run|tick|status|dashboard|train|retrain|install|uninstall``."""
 
 from __future__ import annotations
 
 import argparse
+import filecmp
 import json
+import logging
 import os
+import shutil
 import sys
+from pathlib import Path
 
-from profit_engine.live import macos, paths, queries
+import pandas as pd
+
+from profit_engine.live import macos, paths, queries, training
 from profit_engine.live.app import serve
 from profit_engine.live.market import BinanceBarSource
 from profit_engine.live.notify import Notifier
@@ -84,10 +90,70 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_train(args: argparse.Namespace) -> int:
+    """Train (and publish) one LightGBM model, even if one exists for that month."""
+    setup_logging("train", to_stderr=False)
+    now = pd.Timestamp.now(tz="UTC")
+    cutoff = training.art.month_start(pd.Timestamp(args.month, tz="UTC") if args.month else now)
+    data_dir = Path(args.data_dir) if args.data_dir else paths.market_data_dir()
+    coin = args.symbol.removesuffix("USDT")
+    print(f"Training the {coin} LightGBM model for {cutoff:%B %Y} on closed bars before {cutoff:%Y-%m-%d} UTC...")
+    try:
+        frames = training.load_5m(data_dir, sync=not args.no_sync, now=now)
+        folder = training.train_and_publish(frames, args.symbol, cutoff, paths.models_dir(), args.config)
+    except training.art.NoThreshold:
+        print("No threshold made money in training, so no model was saved (the backtest would stay in cash). "
+              "Any earlier model is kept.", file=sys.stderr)  # fmt: skip
+        return 1
+    except training.DataNotReady as exc:
+        print(f"The price history is not complete yet ({exc}). Nothing was saved; try again later.", file=sys.stderr)
+        return 1
+    except Exception:  # a download or training failure: plain words here, the detail in train.jsonl
+        logging.getLogger("signal_desk.training").exception("train failed")
+        print(f"Training did not finish, so nothing was saved and any earlier model is kept. The details are in "
+              f"{paths.logs_dir() / 'train.jsonl'}.", file=sys.stderr)  # fmt: skip
+        return 1
+    print(f"Saved {folder}")
+    return 0
+
+
+def cmd_retrain(args: argparse.Namespace) -> int:
+    """Train this month's model for every LightGBM book that lacks one (what the monthly job runs)."""
+    setup_logging("retrain", to_stderr=False)
+    results = training.retrain(sync=not args.no_sync)
+    for r in results:
+        print(r["message"])
+    return 0 if all(r["status"] in ("trained", "up_to_date") for r in results) else 1
+
+
+def install_books(use_default: bool, dry_run: bool, out=print) -> None:
+    """Give the user an editable books.json: copy the repo default when there is none. An edited
+    file is replaced only with ``--use-default-books``, and then only after a backup."""
+    user, default = paths.user_books_path(), paths.DEFAULT_BOOKS
+    if user.exists() and filecmp.cmp(user, default, shallow=False):
+        return
+    if user.exists() and not use_default:
+        out(f"Kept your books settings at {user}. To switch to the four research books in {default}, run "
+            "install again with --use-default-books (your file is backed up first).")  # fmt: skip
+        return
+    backup = user.with_name(f"books.json.bak-{pd.Timestamp.now(tz='UTC'):%Y%m%dT%H%M%SZ}") if user.exists() else None
+    if dry_run:
+        first = f"back up {user} to {backup} and " if backup else ""
+        out(f"Would {first}copy {default} to {user}")
+        return
+    user.parent.mkdir(parents=True, exist_ok=True)
+    if backup:
+        shutil.copy2(user, backup)
+        out(f"Backed up your books settings to {backup}")
+    shutil.copyfile(default, user)
+    out(f"Copied the four research books to {user}; edit that file to change them.")
+
+
 def cmd_install(args: argparse.Namespace) -> int:
 
     if not args.dry_run:
         setup_logging("install", to_stderr=False)  # launchctl's raw output goes here, not to the terminal
+    install_books(args.use_default_books, args.dry_run)
     plan = macos.default_plan(stay_awake_on_ac=args.stay_awake_on_ac, dashboard=not args.no_dashboard)
     return macos.install(plan, dry_run=args.dry_run)
 
@@ -114,10 +180,23 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("dashboard", help="serve the dashboard on 127.0.0.1")
     d.add_argument("--port", type=int, default=8765)
     d.set_defaults(fn=cmd_dashboard)
+    tr = sub.add_parser("train", help="train a LightGBM model now (normally the monthly retrain does it)")
+    tr.add_argument("model", choices=["lgbm"])
+    tr.add_argument("--symbol", required=True, choices=list(training.SYMBOLS))
+    tr.add_argument("--month", help="month the model trades, YYYY-MM (default: this month)")
+    tr.add_argument("--config", default=training.DEFAULT_CONFIG, choices=sorted(training.art.WARMUP_BARS))
+    tr.add_argument("--data-dir", help="folder with <SYMBOL>_5m.parquet (default: the app's market_data)")
+    tr.add_argument("--no-sync", action="store_true", help="use the 5m history as it is; download nothing")
+    tr.set_defaults(fn=cmd_train)
+    rt = sub.add_parser("retrain", help="train this month's model for each LightGBM book that lacks one")
+    rt.add_argument("--no-sync", action="store_true", help="use the 5m history as it is; download nothing")
+    rt.set_defaults(fn=cmd_retrain)
     i = sub.add_parser("install", help="install and start the launchd agents")
     i.add_argument("--dry-run", action="store_true", help="print what would be written and run")
     i.add_argument("--stay-awake-on-ac", action="store_true", help="keep the Mac awake while on AC power")
     i.add_argument("--no-dashboard", action="store_true", help="install only the runner agent")
+    i.add_argument("--use-default-books", action="store_true",
+                   help="replace your books.json with the repo default (backed up first)")  # fmt: skip
     i.set_defaults(fn=cmd_install)
     u = sub.add_parser("uninstall", help="stop the launchd agents and remove their files")
     u.add_argument("--dry-run", action="store_true", help="print what would be removed")

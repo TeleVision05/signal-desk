@@ -44,6 +44,13 @@ main { max-width: 1100px; margin: 0 auto; padding: 8px 16px 40px; }
 .why { background: var(--chip); border-radius: 8px; padding: 10px 12px; font-size: 14px; }
 .why small { display: block; color: var(--muted); margin-top: 4px; }
 svg.chart { width: 100%; height: 140px; display: block; margin: 12px 0 4px; }
+.group { margin: 22px 0 8px; }
+.group h2 { font-size: 18px; margin: 0; }
+.group p { margin: 2px 0 10px; color: var(--muted); font-size: 14px; }
+.bh { font-size: 13px; color: var(--muted); margin-top: 2px; }
+.legend { display: flex; gap: 14px; font-size: 12px; color: var(--muted); }
+.legend i { display: inline-block; width: 14px; height: 0; border-top: 2px solid var(--accent); vertical-align: middle; margin-right: 4px; }
+.legend i.bhl { border-top: 2px dashed var(--muted); }
 .axis { color: var(--muted); font-size: 12px; display: flex; justify-content: space-between; }
 h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 16px 0 6px; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
@@ -67,8 +74,9 @@ th { color: var(--muted); font-weight: 500; }
   <div id="beat" class="beat">Loading…</div>
 </header>
 <main>
-  <p class="note">Runs only while this Mac is awake. After sleep it acts on the newest closed bar and skips the bars it missed.</p>
-  <div id="books" class="books"></div>
+  <p class="note">Runs only while this Mac is awake. After sleep it acts on the newest closed bar and skips the bars it missed.
+  Each book is compared with simply buying its coin at the first price the book saw and holding it.</p>
+  <div id="books"></div>
   <h3>What happened</h3>
   <div id="events" class="events"><div class="empty">Nothing yet.</div></div>
 </main>
@@ -76,7 +84,10 @@ th { color: var(--muted); font-weight: 500; }
 const KIND = { catch_up: "Caught up after a pause", gap: "Missing data", stale_data: "Old data, skipped",
   kill_switch: "Daily loss stop", resumed: "Trading again", data_error: "Connection problem",
   bad_price: "Odd price, skipped", strategy_error: "Strategy problem", error: "Problem",
-  clock_skew: "Clock check", config_error: "Settings problem" };
+  clock_skew: "Clock check", config_error: "Settings problem", model_unavailable: "No usable model",
+  model_trained: "New model", model_kept_old: "Kept previous model", model_failed: "Retrain failed" };
+const GROUP_NOTE = { "Trend (vol-targeted)": "Not promoted. The best research candidate, being forward tested.",
+  "LightGBM 4h": "Not promoted. A comparison model: its backtest trailed buy-and-hold." };
 const money = (x) => x == null ? "—" : "$" + Number(x).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const pct = (x) => (x >= 0 ? "+" : "") + x.toFixed(2) + "%";
 function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
@@ -107,18 +118,32 @@ function renderBeat() {
   if (late || r.status !== "ok") box.classList.add("late");
   box.textContent = text;
 }
-function chart(points) {
+function chart(points, b) {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("class", "chart"); svg.setAttribute("viewBox", "0 0 600 140"); svg.setAttribute("preserveAspectRatio", "none");
-  svg.setAttribute("role", "img"); svg.setAttribute("aria-label", "Equity over time");
+  svg.setAttribute("role", "img"); svg.setAttribute("aria-label", "Book value and buy-and-hold value over time");
   if (points.length < 2) return svg;
-  const ys = points.map(p => p.equity), lo = Math.min(...ys), hi = Math.max(...ys), span = (hi - lo) || 1;
+  const p0 = b.bh_start_price, bh = (p) => p0 ? b.starting_equity * p.price / p0 : null;
+  const ys = points.flatMap(p => [p.equity, bh(p)]).filter(y => y != null);
+  const lo = Math.min(...ys), hi = Math.max(...ys), span = (hi - lo) || 1;
   const t0 = Date.parse(points[0].ts), t1 = Date.parse(points[points.length - 1].ts), tw = (t1 - t0) || 1;
-  const d = points.map((p, i) => (i ? "L" : "M") + ((Date.parse(p.ts) - t0) / tw * 596 + 2).toFixed(1) + "," + (136 - (p.equity - lo) / span * 130).toFixed(1)).join(" ");
-  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-  path.setAttribute("d", d); path.setAttribute("fill", "none"); path.setAttribute("stroke", "var(--accent)");
-  path.setAttribute("stroke-width", "2"); path.setAttribute("vector-effect", "non-scaling-stroke");
-  svg.appendChild(path); return svg;
+  const line = (val, stroke, dash) => {
+    const d = points.map((p, i) => (i ? "L" : "M") + ((Date.parse(p.ts) - t0) / tw * 596 + 2).toFixed(1) + "," + (136 - (val(p) - lo) / span * 130).toFixed(1)).join(" ");
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", d); path.setAttribute("fill", "none"); path.setAttribute("stroke", stroke);
+    path.setAttribute("stroke-width", "2"); path.setAttribute("vector-effect", "non-scaling-stroke");
+    if (dash) path.setAttribute("stroke-dasharray", "5 4");
+    svg.appendChild(path);
+  };
+  if (p0) line(bh, "var(--muted)", true);
+  line(p => p.equity, "var(--accent)", false);
+  return svg;
+}
+function vsHold(b) {
+  if (b.bh_equity == null) return "Buy and hold: shown after the first price check.";
+  const gap = b.return_pct - b.bh_return_pct;
+  return "Buy and hold since " + when(b.bh_start_ts) + ": " + money(b.bh_equity) + " (" + pct(b.bh_return_pct) + ", before fees). " +
+    "This book is " + (Math.abs(gap) < 0.005 ? "level with it." : (gap > 0 ? "ahead" : "behind") + " by " + Math.abs(gap).toFixed(2) + " points.");
 }
 function position(b) {
   if (b.paused_until && Date.parse(b.paused_until) > Date.now()) return "In cash, paused by the daily loss limit until " + when(b.paused_until) + ".";
@@ -144,13 +169,14 @@ function bookCard(b, curve, fills) {
   left.appendChild(el("div", "title", b.title));
   const chips = el("div", "chips");
   chips.appendChild(el("span", "chip", b.symbol + " · " + b.timeframe + " bars"));
-  chips.appendChild(el("span", "chip " + (b.promoted ? "promoted" : "demo"), b.promoted ? "Promoted strategy" : "Demo strategy — not promoted"));
+  chips.appendChild(el("span", "chip " + (b.promoted ? "promoted" : "demo"), b.promoted ? "Promoted strategy" : b.label.charAt(0).toUpperCase() + b.label.slice(1)));
   chips.appendChild(el("span", "chip", b.strategy + " v" + b.strategy_version));
   if (!b.enabled) chips.appendChild(el("span", "chip paused", "Turned off"));
   left.appendChild(chips);
   const right = el("div", "equity");
   right.appendChild(el("div", "big", money(b.equity)));
   right.appendChild(el("div", b.return_pct >= 0 ? "up" : "down", pct(b.return_pct) + " since start (" + money(b.starting_equity) + ")"));
+  if (b.bh_equity != null) right.appendChild(el("div", "bh", "Buy and hold: " + money(b.bh_equity) + " (" + pct(b.bh_return_pct) + ")"));
   top.append(left, right); card.appendChild(top);
   card.appendChild(el("div", "pos", position(b)));
   const why = el("div", "why");
@@ -159,7 +185,11 @@ function bookCard(b, curve, fills) {
     why.appendChild(el("small", null, "Decided on the bar that opened " + when(b.last_decision.bar_open_ts) + ", filled at the next bar's open (" + when(b.last_decision.fill_bar_ts) + ")."));
   } else why.textContent = "No decision yet. The book waits for its first closed " + b.timeframe + " bar.";
   card.appendChild(why);
-  card.appendChild(chart(curve));
+  card.appendChild(el("div", "pos", vsHold(b)));
+  card.appendChild(chart(curve, b));
+  const legend = el("div", "legend"), a = el("span"), h = el("span");
+  a.append(el("i"), document.createTextNode("This book")); h.append(el("i", "bhl"), document.createTextNode("Buy and hold " + b.coin));
+  legend.append(a, h); card.appendChild(legend);
   const axis = el("div", "axis");
   axis.append(el("span", null, curve.length ? when(curve[0].ts) : ""), el("span", null, curve.length ? "Marked " + ago(curve[curve.length - 1].ts) : "No equity marks yet"));
   card.appendChild(axis);
@@ -188,7 +218,13 @@ async function refresh() {
       const [curve, fills] = await Promise.all([getJSON("/api/books/" + enc + "/equity?limit=2000"), getJSON("/api/books/" + enc + "/fills?limit=20")]);
       return bookCard(b, curve, fills);
     }));
-    box.replaceChildren(...cards);
+    const groups = new Map();  // strategy -> its cards, in the order the server lists them
+    ov.books.forEach((b, i) => { if (!groups.has(b.family)) groups.set(b.family, []); groups.get(b.family).push(cards[i]); });
+    box.replaceChildren(...[...groups].map(([family, list]) => {
+      const sec = el("section", "group"), grid = el("div", "books");
+      sec.append(el("h2", null, family), el("p", null, GROUP_NOTE[family] || ""));
+      grid.append(...list); sec.appendChild(grid); return sec;
+    }));
     if (!cards.length) box.appendChild(el("div", "empty", "No books yet. Start the runner (signal-desk-live run) and they will appear after its first check."));
     renderEvents(await getJSON("/api/events?limit=40"), titles);
   } catch (e) {

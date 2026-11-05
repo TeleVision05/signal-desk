@@ -63,7 +63,12 @@ SCHEMA_V1 = (
     """CREATE TABLE IF NOT EXISTS notifications (
         id INTEGER PRIMARY KEY, book_id TEXT NOT NULL, created_at TEXT NOT NULL, text TEXT NOT NULL, sent_at TEXT)""",
 )
-MIGRATIONS: dict[int, tuple[str, ...]] = {1: SCHEMA_V1}
+# v2: the dashboard's status label and strategy group for each book.
+SCHEMA_V2 = (
+    "ALTER TABLE books ADD COLUMN status_label TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE books ADD COLUMN family TEXT NOT NULL DEFAULT ''",
+)
+MIGRATIONS: dict[int, tuple[str, ...]] = {1: SCHEMA_V1, 2: SCHEMA_V2}
 SCHEMA_VERSION = max(MIGRATIONS)
 TABLES = frozenset({"books", "decisions", "fills", "equity_marks", "events", "heartbeat", "notifications"})
 
@@ -170,13 +175,14 @@ class Store:
                 f"(format {version}; this copy understands up to {SCHEMA_VERSION}). Update this checkout, or set "
                 "SIGNAL_DESK_LIVE_DB to a different file."
             )
-        if version == SCHEMA_VERSION:
+        if version >= 1:
             names = {r[0] for r in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if not names >= TABLES:
                 raise StoreError(
                     f"{self.path} is not a Signal Desk Live database (it is marked with a version but lacks the "
                     "expected tables). Set SIGNAL_DESK_LIVE_DB to a different file."
                 )
+        if version == SCHEMA_VERSION:
             return version
         with self.tx() as c:
             current = int(c.execute("PRAGMA user_version").fetchone()[0])
@@ -201,11 +207,12 @@ class Store:
             "params_json": json.dumps(meta.params, sort_keys=True, default=str), "artifact_hash": meta.artifact_hash,
             "promoted": int(meta.promoted), "enabled": int(spec.enabled), "starting_equity": spec.starting_equity,
             "cash": spec.starting_equity, "created_at": iso(now), "updated_at": iso(now),
+            "status_label": getattr(meta, "status", ""), "family": getattr(meta, "family", ""),
         }  # fmt: skip
         cols = ", ".join(row)
         marks = ", ".join(f":{k}" for k in row)
         refresh = ("title", "strategy", "strategy_version", "strategy_source", "params_json", "artifact_hash",
-                   "promoted", "enabled")  # fmt: skip
+                   "promoted", "enabled", "status_label", "family")  # fmt: skip
         update = ", ".join(f"{k}=excluded.{k}" for k in refresh)
         with self.tx() as c:
             have = c.execute("SELECT symbol, timeframe FROM books WHERE book_id=?", (spec.book_id,)).fetchone()
@@ -216,6 +223,17 @@ class Store:
     def book(self, book_id: str, conn: sqlite3.Connection | None = None) -> dict | None:
         row = (conn or self.conn).execute("SELECT * FROM books WHERE book_id=?", (book_id,)).fetchone()
         return dict(row) if row else None
+
+    def strategy_target(self, book_id: str) -> float:
+        """The strategy's own last target: what a stateful strategy continues from. A decision
+        overridden by the daily-loss pause recorded the strategy's wish as ``strategy_target``."""
+        row = self.conn.execute(
+            "SELECT target, details_json FROM decisions WHERE book_id=? ORDER BY bar_open_ts DESC LIMIT 1", (book_id,)
+        ).fetchone()
+        if row is None:
+            return 0.0
+        details = json.loads(row["details_json"] or "{}")
+        return float(details.get("strategy_target", row["target"]))
 
     # -- the exactly-once bar commit -------------------------------------------------------
 

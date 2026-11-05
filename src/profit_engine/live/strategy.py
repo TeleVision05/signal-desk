@@ -9,6 +9,12 @@ flat, as in the harness. The runner fills the target at the NEXT bar's open, exa
 ``decide`` receives the last ``warmup_bars`` closed bars (fewer means the book waits), so a
 strategy must be a function of that window only. :func:`target_series` replays a strategy
 bar by bar with the same window, which is how a backtest of the live code path is built.
+
+A strategy whose next target depends on its own previous one (a hysteresis band) sets
+``stateful = True``; :func:`call_decide` then passes ``prev_target``: the strategy's own last
+target as the runner persisted it (before any daily-loss pause), or 0.0 for a new book.
+A strategy that cannot decide at all (say its model file is missing) raises
+:class:`StrategyUnavailable` with a plain-language message; the book keeps its position.
 """
 
 from __future__ import annotations
@@ -31,10 +37,12 @@ class StrategyMeta:
     artifact_hash: str = ""
     promoted: bool = False
     source: str = "builtin"
+    status: str = ""  # label shown when not promoted (defaults to DEMO_LABEL)
+    family: str = ""  # dashboard group, e.g. "Trend (vol-targeted)"
 
     @property
     def label(self) -> str:
-        return PROMOTED_LABEL if self.promoted else DEMO_LABEL
+        return PROMOTED_LABEL if self.promoted else (self.status or DEMO_LABEL)
 
 
 @dataclass(frozen=True)
@@ -58,6 +66,19 @@ class Strategy(Protocol):
 
 class InvalidTarget(ValueError):
     """A strategy returned something that is not a long/flat target in [0, 1]."""
+
+
+class StrategyUnavailable(RuntimeError):
+    """The strategy cannot decide at all (e.g. no usable model); the message is for the user."""
+
+
+def call_decide(
+    strategy: Strategy, bars: pd.DataFrame, other: pd.DataFrame | None, prev_target: float = 0.0
+) -> float | Decision:
+    """``strategy.decide``, passing ``prev_target`` only to a ``stateful`` strategy."""
+    if getattr(strategy, "stateful", False):
+        return strategy.decide(bars, other, prev_target=float(prev_target))
+    return strategy.decide(bars, other)
 
 
 def normalize_decision(raw: float | Decision) -> Decision:
@@ -95,15 +116,22 @@ def other_window(other: pd.DataFrame, window: pd.DataFrame) -> pd.DataFrame:
     return other.loc[window.index[0] : window.index[-1]]
 
 
-def target_series(strategy: Strategy, bars: pd.DataFrame, other: pd.DataFrame | None = None) -> pd.Series:
-    """Per-bar targets exactly as the live runner would decide them (NaN while warming up)."""
+def target_series(
+    strategy: Strategy, bars: pd.DataFrame, other: pd.DataFrame | None = None, prev_target: float = 0.0
+) -> pd.Series:
+    """Per-bar targets exactly as the live runner would decide them (NaN while warming up).
+
+    A stateful strategy gets its own previous output back each bar, starting from
+    ``prev_target`` (0.0: a new book is flat), as the runner feeds it from the store."""
     out = pd.Series(np.nan, index=bars.index, dtype="float64")
+    prev = float(prev_target)
     for i in range(len(bars)):
         window = decision_window(bars.iloc[: i + 1], strategy)
         if window is None:
             continue
         oth = other_window(other, window) if other is not None else None
-        out.iloc[i] = normalize_decision(strategy.decide(window, oth)).target
+        prev = normalize_decision(call_decide(strategy, window, oth, prev)).target
+        out.iloc[i] = prev
     return out
 
 
@@ -142,6 +170,3 @@ class SmaTrendDemo:
             f"the {self.slow}-bar average ({_fmt(slow)}), {verdict}."
         )
         return Decision(1.0 if up else 0.0, text, {"sma_fast": fast, "sma_slow": slow})
-
-
-BUILTINS = {SmaTrendDemo.name: SmaTrendDemo}

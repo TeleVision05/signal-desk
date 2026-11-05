@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PYTHONPATH</key>
+		<string>/opt/signal-desk/src</string>
+		<key>PYTHONUNBUFFERED</key>
+		<string>1</string>
+	</dict>
+	<key>ExitTimeOut</key>
+	<integer>30</integer>
+	<key>Label</key>
+	<string>com.signaldesk.retrain</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/signal-desk/.venv/bin/python</string>
+		<string>-m</string>
+		<string>profit_engine.live.cli</string>
+		<string>retrain</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/demo/Library/Logs/SignalDesk/retrain.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/demo/Library/Logs/SignalDesk/retrain.out.log</string>
+	<key>StartCalendarInterval</key>
+	<array>
+		<dict>
+			<key>Day</key>
+			<integer>1</integer>
+			<key>Hour</key>
+			<integer>6</integer>
+			<key>Minute</key>
+			<integer>30</integer>
+		</dict>
+		<dict>
+			<key>Day</key>
+			<integer>2</integer>
+			<key>Hour</key>
+			<integer>6</integer>
+			<key>Minute</key>
+			<integer>30</integer>
+		</dict>
+	</array>
+	<key>ThrottleInterval</key>
+	<integer>30</integer>
+	<key>WorkingDirectory</key>
+	<string>/opt/signal-desk</string>
+</dict>
+</plist>
