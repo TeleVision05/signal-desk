@@ -170,8 +170,9 @@ function bookCard(b, curve, fills) {
   const chips = el("div", "chips");
   chips.appendChild(el("span", "chip", b.symbol + " · " + b.timeframe + " bars"));
   chips.appendChild(el("span", "chip " + (b.promoted ? "promoted" : "demo"), b.promoted ? "Promoted strategy" : b.label.charAt(0).toUpperCase() + b.label.slice(1)));
-  chips.appendChild(el("span", "chip", b.strategy + " v" + b.strategy_version));
+  chips.appendChild(el("span", "chip", b.strategy + (b.strategy_version === "none" ? " · no usable model" : " v" + b.strategy_version)));
   if (!b.enabled) chips.appendChild(el("span", "chip paused", "Turned off"));
+  if (b.problem) chips.appendChild(el("span", "chip paused", "Not deciding"));
   left.appendChild(chips);
   const right = el("div", "equity");
   right.appendChild(el("div", "big", money(b.equity)));
@@ -180,7 +181,10 @@ function bookCard(b, curve, fills) {
   top.append(left, right); card.appendChild(top);
   card.appendChild(el("div", "pos", position(b)));
   const why = el("div", "why");
-  if (b.last_decision) {
+  if (b.problem) {  // the book cannot decide right now: say why instead of an old or "waiting" message
+    why.appendChild(document.createTextNode(b.problem));
+    if (b.last_decision) why.appendChild(el("small", null, "Its last decision was on the bar that opened " + when(b.last_decision.bar_open_ts) + "."));
+  } else if (b.last_decision) {
     why.appendChild(document.createTextNode(b.last_decision.explanation));
     why.appendChild(el("small", null, "Decided on the bar that opened " + when(b.last_decision.bar_open_ts) + ", filled at the next bar's open (" + when(b.last_decision.fill_bar_ts) + ")."));
   } else why.textContent = "No decision yet. The book waits for its first closed " + b.timeframe + " bar.";

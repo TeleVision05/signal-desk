@@ -24,7 +24,7 @@ versioned model artifact (see [Adding a promoted model](#adding-a-promoted-model
 ```bash
 .venv/bin/pip install -e .                       # adds the signal-desk-live command
 signal-desk-live train lgbm --symbol BTCUSDT     # train this month's LightGBM model (and ETHUSDT)
-signal-desk-live retrain                         # train any LightGBM book's model missing for this month
+signal-desk-live retrain                         # train any LightGBM book's model missing or unusable this month
 signal-desk-live tick --no-notify                # check every book once, print JSON
 signal-desk-live status                          # equity and position per book
 signal-desk-live dashboard                       # http://127.0.0.1:8765 (Ctrl-C to stop)
@@ -100,8 +100,8 @@ no external display, macOS can still sleep. No sudo is involved.
 | model artifacts | `~/Library/Application Support/SignalDesk/models/` (LightGBM: `lgbm_4h_h30_pt2_sl1/<SYMBOL>/<YYYY-MM>-<created>/`) | `SIGNAL_DESK_MODELS_DIR` |
 | 5m history for training | `~/Library/Application Support/SignalDesk/market_data/<SYMBOL>_5m.parquet` | `SIGNAL_DESK_DATA_DIR` |
 | app folder (all of the above) | `~/Library/Application Support/SignalDesk` | `SIGNAL_DESK_HOME` |
-| JSON logs | `~/Library/Logs/SignalDesk/runner.jsonl` (rotated: 5 x 5 MB), `tick.jsonl` | `SIGNAL_DESK_LOGS` |
-| launchd stdout/stderr | `~/Library/Logs/SignalDesk/{runner,dashboard}.{out,err}.log`: crash output only, **not rotated** (the runner agent runs `run --no-console-log`, so its JSON log is not copied here) | |
+| JSON logs | `~/Library/Logs/SignalDesk/runner.jsonl` (rotated: 5 x 5 MB), `tick.jsonl`; `retrain.jsonl` (each scheduled or manual retrain: a failed one's full error is here), `train.jsonl` (`train lgbm`), `install.jsonl` (launchctl's own output) | `SIGNAL_DESK_LOGS` |
+| launchd stdout/stderr | `~/Library/Logs/SignalDesk/{runner,dashboard}.{out,err}.log`: crash output only, **not rotated** (the runner agent runs `run --no-console-log`, so its JSON log is not copied here); `retrain.{out,err}.log`: what each retrain run printed, and a crash before it could log | |
 | launch agents | `~/Library/LaunchAgents/com.signaldesk.{live,dashboard,retrain}.plist` | |
 | single-instance lock | `~/Library/Application Support/SignalDesk/runner.lock` (`flock`, freed if the process dies) | |
 
@@ -112,10 +112,15 @@ off. At most one per book per 5 minutes; anything held back is summarised in the
 
 `install` writes three per-user agents and loads them with `launchctl bootstrap gui/$UID`:
 
-* `com.signaldesk.retrain`: `python -m profit_engine.live.cli retrain` at 06:30 local time on
-  the 1st and 2nd of each month (launchd runs a time missed during sleep on wake; the 2nd
-  catches a Mac that was off on the 1st, and is a no-op otherwise). It has no `KeepAlive`: it
-  runs, exits and waits for the next date. `install` reports it as scheduled, not running.
+* `com.signaldesk.retrain`: `python -m profit_engine.live.cli retrain` every hour at 10 past
+  (launchd runs a time missed during sleep once, on wake). Almost every run only checks that
+  this month's models exist and load, and exits. It runs hourly because launchd's calendar is
+  the Mac's **local** clock while the models switch at 00:00 **UTC** on the 1st: the old
+  schedule, 06:30 local on the 1st, was 14:30 UTC in US Pacific (three 4h bars late) and
+  still the previous UTC month east of UTC. Hourly, the new model is trained by about 01:10
+  UTC in any time zone, before the month's first 4h bar closes at 04:00 UTC. It has no
+  `KeepAlive`: it runs, exits and waits for the next hour. `install` reports it as scheduled,
+  not running (and `install --dry-run` does not claim to check it).
 * `com.signaldesk.live`: `python -m profit_engine.live.cli run --no-console-log`
 * `com.signaldesk.dashboard`: `python -m profit_engine.live.cli dashboard` (127.0.0.1:8765).
   It answers only requests addressed to `127.0.0.1`, `localhost` or `[::1]` (any other `Host`
@@ -231,8 +236,10 @@ rounds to 0 exits at once). Fractional targets: the book can hold, say, 35% BTC.
 `lgbm_4h_h30_pt2_sl1` (`lgbm_core.py`, `lgbm_artifacts.py`, `lgbm.py`): long for the next 4h
 bar when the model's probability that a long entry hits +2 sigma before -1 sigma within 30
 bars (and beats a round trip of costs) is above the month's threshold; flat otherwise, and
-flat on any bar where a feature is missing (no matching bar of the other coin, too little
-history), as the research did. Features use both coins (cross-asset returns).
+flat on a bar where a feature is missing (too little history), as the research did. Features
+use both coins (cross-asset returns) on the bars both have, so on a bar the other coin lacks
+(a missing 5m bar dropped it) the book **keeps its position**: the research never saw such a
+bar and held its position across it.
 
 * **Training** (`signal-desk-live train lgbm --symbol BTCUSDT [--month YYYY-MM]`): the research
   walk-forward fold for that month, on every closed bar from 2017-09-01 up to the first
@@ -251,14 +258,27 @@ history), as the research did. Features use both coins (cross-asset returns).
   of both coins' 5m bars, git sha, lightgbm / scikit-learn / numpy / pandas versions, the
   model file's SHA256). A new artifact is written to a hidden temporary folder and renamed
   into place only after it trained, found a threshold, and reloaded with the same features
-  and trees. Books load the newest folder.
-* **Refusals.** A book refuses to decide, keeps its position and shows "No usable model" on
-  the dashboard when there is no artifact, the model file does not match its SHA256, or the
-  installed library versions differ from the recorded ones. Retrain to fix it.
-* **Monthly retrain** (`signal-desk-live retrain`, run by `com.signaldesk.retrain`): for each
-  LightGBM book, trains the current month's model if it does not exist yet. If training fails,
-  or no threshold made money (the research would trade flat that month), the previous model
-  stays in use and an event says so. The month is judged on this Mac's clock, in UTC.
+  and trees. Each bar is decided by the newest folder for the month (UTC) the bar **opens**
+  in, as the research decides month M with fold M's model: a late decision on the last
+  October bar uses October's model even after November's exists. The dashboard shows the
+  newest folder's version.
+* **Refusals.** A book refuses to decide, keeps its position and says why on its card ("Not
+  deciding") and in the events when there is no artifact, the model file does not match its
+  SHA256, the installed library versions differ from the recorded ones, or the model for the
+  bar's month is not trained yet. It never decides a new month's bar with last month's
+  model: the bar waits, unclaimed, and is decided as soon as the model exists (normally
+  within the hour after 00:00 UTC on the 1st, long before that bar closes). The message is in
+  plain words; the technical detail (file path, versions) is in `runner.jsonl`.
+  `signal-desk-live retrain` fixes an unusable model for the current month: it retrains a
+  month whose newest artifact does not load, not only a month with no artifact.
+* **Retrain** (`signal-desk-live retrain`, run every hour by `com.signaldesk.retrain`): for
+  each LightGBM book, trains the current month's model unless a usable one exists. If
+  training fails, nothing is published, the book makes no decisions for the new month and
+  keeps its position (it never falls back to last month's model), an event says so (at most
+  once a day) and the next hourly run tries again; the full error is in `retrain.jsonl`. If no threshold made money (the research would trade flat
+  that month), the previous model stays in use for the month, a marker file
+  (`.no-threshold-<YYYY-MM>.json` next to the model folders) stops later runs from training
+  it again, and an event says so. The month is judged on this Mac's clock, in UTC.
 * **Warm-up: 3000 bars (500 days).** `emadist_180` is an EWM with infinite memory. Measured
   2026-11-05 (150 random bars per symbol): worst relative feature difference 1.7e-07 at 2000
   bars, 1.3e-09 at 2500, 5e-10 at 3000 (there a rolling-sum rounding difference, not the EWM).
@@ -324,6 +344,15 @@ backtest of the live code path.
   default) can force a sale the backtest never made (the trend strategy keeps its own state
   through the pause and the book returns to it the next bar); a LightGBM month with no
   profitable threshold keeps last month's model where the research stayed in cash.
+* A LightGBM book whose month's model is not trained when its first bar of the month closes
+  (the Mac was off or asleep over 00:00-04:00 UTC on the 1st, or the download failed) keeps
+  its position and skips the bars that close before the hourly retrain catches up, where the
+  research traded them with the new model. Measured 2026-11-05: with the old 06:30-local
+  schedule on US Pacific time, 5 of 33 (BTC) and 9 of 33 (ETH) of those first-three bars of
+  2025-08..2026-06 would have been decided differently from the research.
+* If a month found no profitable threshold AND the earlier model it keeps cannot be used
+  (say after a library upgrade), `retrain` does not fix it (it would find no threshold
+  again): run `signal-desk-live train lgbm --symbol <SYMBOL> --month <earlier YYYY-MM>`.
 * A `signal-desk-live tick` from the command line downloads the full warm-up history every
   time (the cache lives only as long as the process).
 

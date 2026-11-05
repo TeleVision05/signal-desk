@@ -43,6 +43,26 @@ def buy_and_hold(conn: sqlite3.Connection, book: dict, price: float | None) -> d
     return {"bh_start_ts": first["ts"], "bh_start_price": first["price"], "bh_equity": value, "bh_return_pct": pct}
 
 
+PROBLEM_FRESH = pd.Timedelta("90min")  # the runner repeats the event every hour while it lasts
+
+
+def current_problem(conn: sqlite3.Connection, book: dict, decision: dict | None) -> str | None:
+    """Why the book cannot decide right now (e.g. no usable model), or None: the newest such event,
+    if it is newer than the book's last decision and recent next to its last price mark (the
+    runner's own clock, so a stopped runner leaves the last known state on the card)."""
+    row = conn.execute(
+        "SELECT ts, message FROM events WHERE book_id=? AND kind='model_unavailable' ORDER BY ts DESC, id DESC LIMIT 1",
+        (book["book_id"],),
+    ).fetchone()
+    if row is None:
+        return None
+    if book["last_mark_ts"] and pd.Timestamp(book["last_mark_ts"]) - pd.Timestamp(row["ts"]) > PROBLEM_FRESH:
+        return None
+    if decision is not None and pd.Timestamp(decision["decided_at"]) >= pd.Timestamp(row["ts"]):
+        return None
+    return row["message"]
+
+
 def book_summary(conn: sqlite3.Connection, book: dict) -> dict:
     bid = book["book_id"]
     mark = conn.execute("SELECT * FROM equity_marks WHERE book_id=? ORDER BY ts DESC LIMIT 1", (bid,)).fetchone()
@@ -81,6 +101,7 @@ def book_summary(conn: sqlite3.Connection, book: dict) -> dict:
         "last_bar_ts": book["last_bar_ts"],
         "paused_until": book["paused_until"],
         "last_decision": dict(decision) if decision else None,
+        "problem": current_problem(conn, book, dict(decision) if decision else None),
         **buy_and_hold(conn, book, price),
     }
 

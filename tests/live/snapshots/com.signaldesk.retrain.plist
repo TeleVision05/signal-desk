@@ -31,20 +31,8 @@
 	<key>StartCalendarInterval</key>
 	<array>
 		<dict>
-			<key>Day</key>
-			<integer>1</integer>
-			<key>Hour</key>
-			<integer>6</integer>
 			<key>Minute</key>
-			<integer>30</integer>
-		</dict>
-		<dict>
-			<key>Day</key>
-			<integer>2</integer>
-			<key>Hour</key>
-			<integer>6</integer>
-			<key>Minute</key>
-			<integer>30</integer>
+			<integer>10</integer>
 		</dict>
 	</array>
 	<key>ThrottleInterval</key>

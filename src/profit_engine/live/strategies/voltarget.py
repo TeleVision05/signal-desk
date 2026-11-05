@@ -10,7 +10,7 @@ and then moves the target to ``round(raw / 0.05) * 0.05`` only when ``|raw - tar
 strategy never re-runs it over its window: it takes ``prev_target`` (the book's own last
 target, persisted by the runner) and applies ONE step of the band to the newest bar.
 Replayed bar by bar from the first bar with ``prev_target`` fed back, it reproduces the
-research target exactly (``tests/live/test_live_strategy_parity.py``).
+research target exactly (``tests/live/test_live_trend_parity.py``).
 
 Warm-up. The EWMA vol has infinite memory, so a window of ``warmup_bars`` bars gives a vol
 that differs from the full-history one by the weight of the bars left out. Measured on the

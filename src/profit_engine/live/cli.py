@@ -126,6 +126,20 @@ def cmd_retrain(args: argparse.Namespace) -> int:
     return 0 if all(r["status"] in ("trained", "up_to_date") for r in results) else 1
 
 
+def _utc_now() -> pd.Timestamp:
+    return pd.Timestamp.now(tz="UTC")
+
+
+def _backup_path(user: Path) -> Path:
+    """A backup name no earlier backup has: two installs in the same second get -2, -3, ..."""
+    base = user.with_name(f"books.json.bak-{_utc_now():%Y%m%dT%H%M%SZ}")
+    path, n = base, 1
+    while path.exists():
+        n += 1
+        path = base.with_name(f"{base.name}-{n}")
+    return path
+
+
 def install_books(use_default: bool, dry_run: bool, out=print) -> None:
     """Give the user an editable books.json: copy the repo default when there is none. An edited
     file is replaced only with ``--use-default-books``, and then only after a backup."""
@@ -136,7 +150,7 @@ def install_books(use_default: bool, dry_run: bool, out=print) -> None:
         out(f"Kept your books settings at {user}. To switch to the four research books in {default}, run "
             "install again with --use-default-books (your file is backed up first).")  # fmt: skip
         return
-    backup = user.with_name(f"books.json.bak-{pd.Timestamp.now(tz='UTC'):%Y%m%dT%H%M%SZ}") if user.exists() else None
+    backup = _backup_path(user) if user.exists() else None
     if dry_run:
         first = f"back up {user} to {backup} and " if backup else ""
         out(f"Would {first}copy {default} to {user}")

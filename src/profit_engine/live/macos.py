@@ -2,9 +2,13 @@
 
 * ``com.signaldesk.live`` runs ``signal-desk-live run`` (the paper-trading loop);
 * ``com.signaldesk.dashboard`` runs the localhost dashboard on 127.0.0.1:8765;
-* ``com.signaldesk.retrain`` runs ``signal-desk-live retrain`` at 06:30 local time on the 1st
-  and 2nd of each month (launchd runs a missed time on wake). Retraining is a no-op when the
-  month's LightGBM models exist, so the second date only catches a run missed on the first.
+* ``com.signaldesk.retrain`` runs ``signal-desk-live retrain`` every hour at 10 past (launchd
+  runs a time missed during sleep once on wake). Retraining is a no-op while the month's
+  LightGBM models exist and load, so almost every run only checks. Hourly, not "the 1st at
+  06:30": launchd's calendar is the Mac's LOCAL clock, while the research switches models at
+  00:00 UTC; 06:30 on the 1st in US Pacific is 14:30 UTC (three 4h bars late) and east of UTC
+  it is still the previous UTC month. An hourly check trains the new model by 01:10 UTC in any
+  time zone, before the month's first 4h bar closes at 04:00 UTC.
 
 All are per-user LaunchAgents (``~/Library/LaunchAgents``), loaded with
 ``launchctl bootstrap gui/<uid>``: no sudo, nothing system-wide. ``RunAtLoad`` starts them at
@@ -43,7 +47,7 @@ from profit_engine.live import paths
 RUNNER_LABEL = "com.signaldesk.live"
 DASHBOARD_LABEL = "com.signaldesk.dashboard"
 RETRAIN_LABEL = "com.signaldesk.retrain"
-RETRAIN_TIMES = ({"Day": 1, "Hour": 6, "Minute": 30}, {"Day": 2, "Hour": 6, "Minute": 30})
+RETRAIN_TIMES = ({"Minute": 10},)  # every hour at 10 past: see the module docstring
 CAFFEINATE = "/usr/bin/caffeinate"
 # Copied into the agents' environment when set at install time. DATABASE_URL is deliberately
 # never forwarded: the live store is local SQLite only.
@@ -216,7 +220,8 @@ def install(
             out(f"Would write {path}:\n{render(plist).decode()}")
             out(f"Would run: {shlex.join(bootout)}   (ignored if not loaded)")
             out(f"Would run: {shlex.join(bootstrap)}")
-            out(f"Would check it is running: launchctl print gui/{uid}/{label}")
+            if label != RETRAIN_LABEL:  # scheduled, not running: install does not check it either
+                out(f"Would check it is running: launchctl print gui/{uid}/{label}")
             continue
         plan.logs.mkdir(parents=True, exist_ok=True)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -229,7 +234,7 @@ def install(
             loaded.append(label)
     if RETRAIN_LABEL in loaded:  # scheduled, so it is not running now: nothing to check
         loaded.remove(RETRAIN_LABEL)
-        out(f"Scheduled {RETRAIN_LABEL}: retrains the LightGBM models on the 1st and 2nd of each month at 06:30.")
+        out(f"Scheduled {RETRAIN_LABEL}: checks every hour and trains the LightGBM models when a new month starts.")
     if loaded:
         pause(STARTUP_CHECK_S)  # a blocked or broken agent exits within a second or two
         failed += sum(not _check_running(label, plan, uid, probe, out) for label in loaded)

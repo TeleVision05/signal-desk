@@ -295,7 +295,8 @@ def decide_book(ctx: TickContext, spec: BookSpec, book: dict) -> str:
     except _Skip as skip:
         return skip.status
     except StrategyUnavailable as exc:
-        log.warning("strategy unavailable", extra={"book_id": spec.book_id, "error": str(exc)})
+        detail = getattr(spec.strategy, "problem_detail", "")  # technical detail: the log only
+        log.warning("strategy unavailable", extra={"book_id": spec.book_id, "error": str(exc), "detail": detail})
         ctx.event(spec.book_id, "model_unavailable", str(exc), key=_bucket(ctx.now, 60))
         return "model_unavailable"
     commit = ctx.store.commit_bar(

@@ -9,7 +9,13 @@ Layout (outside git, under the runner's models folder, see ``paths.models_dir``)
 ``TRAIN_START`` up to the start of that month (the research fold for that month). A new
 artifact is written into a hidden temporary folder and renamed into place only after it
 trained, produced a threshold, and passed a reload check, so a failed or flat retrain never
-replaces the artifact in use. The newest folder (by name) is the one the books load.
+replaces the artifact in use. A bar is decided by the newest folder for the month it OPENS in
+(:func:`folder_for_month`), as the research decides month M with fold M's model.
+
+A month whose training found no profitable threshold leaves a marker file
+``.no-threshold-<YYYY-MM>.json`` next to the folders: that month keeps the newest earlier model
+(the research stayed in cash; see docs/live_runner.md, Known limitations), and the hourly
+retrain does not train it again (the result would be the same: training is deterministic).
 
 ``metadata.json`` records the config, model parameters, feature columns, threshold and the
 quantile it came from, the training window, a hash of the 5m data, the git sha and the
@@ -46,6 +52,20 @@ OTHER = {"BTCUSDT": "ETHUSDT", "ETHUSDT": "BTCUSDT"}
 
 class NoThreshold(RuntimeError):
     """Inner CV found no threshold that made money: research trades flat that month."""
+
+
+class UnusableArtifact(ArtifactError):
+    """An artifact that cannot be used; ``str()`` is the technical detail (for the logs) and
+    ``reason`` says why in plain words (for the dashboard)."""
+
+    def __init__(self, detail: str, reason: str) -> None:
+        super().__init__(detail)
+        self.reason = reason
+
+
+VERSIONS_REASON = "it was trained with different library versions than the ones installed now"
+CHANGED_REASON = "its model file changed or was damaged after it was trained"
+INCOMPLETE_REASON = "some of its files are missing or unreadable"
 
 
 def library_versions() -> dict[str, str]:
@@ -157,7 +177,7 @@ def check_versions(meta: dict) -> None:
     diff = {k: (want.get(k), v) for k, v in have.items() if want.get(k) != v}
     if diff:
         said = ", ".join(f"{k} {w} (installed {h})" for k, (w, h) in diff.items())
-        raise ArtifactError(f"it was trained with {said}")
+        raise UnusableArtifact(f"it was trained with {said}", VERSIONS_REASON)
 
 
 def load(folder: Path) -> Loaded:
@@ -166,17 +186,20 @@ def load(folder: Path) -> Loaded:
     try:
         meta = json.loads((folder / META_FILE).read_text())
     except (OSError, json.JSONDecodeError) as exc:
-        raise ArtifactError(f"{folder / META_FILE} is missing or unreadable") from exc
+        raise UnusableArtifact(f"{folder / META_FILE} is missing or unreadable", INCOMPLETE_REASON) from exc
     check_versions(meta)
     path = folder / str(meta.get("artifact", MODEL_FILE))
     if not path.exists():
-        raise ArtifactError(f"{path} is missing")
+        raise UnusableArtifact(f"{path} is missing", INCOMPLETE_REASON)
     digest = sha256_file(path)
     if digest != meta.get("artifact_sha256"):
-        raise ArtifactError(f"{path} does not match the SHA256 recorded when it was trained")
-    booster = lgb.Booster(model_file=str(path))
+        raise UnusableArtifact(f"{path} does not match the SHA256 recorded when it was trained", CHANGED_REASON)
+    try:
+        booster = lgb.Booster(model_file=str(path))
+    except lgb.basic.LightGBMError as exc:
+        raise UnusableArtifact(f"{path} could not be read by lightgbm: {exc}", CHANGED_REASON) from exc
     if booster.feature_name() != list(meta.get("feature_columns") or []):
-        raise ArtifactError(f"{path} has different feature columns than its metadata")
+        raise UnusableArtifact(f"{path} has different feature columns than its metadata", CHANGED_REASON)
     return Loaded(booster, meta, folder, digest)
 
 
@@ -185,3 +208,38 @@ def load_latest(models_dir: Path, cfg_name: str, symbol: str) -> Loaded:
     if not found:
         raise FileNotFoundError(symbol_dir(models_dir, cfg_name, symbol))
     return load(found[-1])
+
+
+def trades_month(folder: Path) -> str:
+    """``YYYY-MM`` of the month an artifact folder trades (its name starts with it)."""
+    return Path(folder).name[:7]
+
+
+def _marker(models_dir: Path, cfg_name: str, symbol: str, month: str) -> Path:
+    return symbol_dir(models_dir, cfg_name, symbol) / f".no-threshold-{month}.json"
+
+
+def mark_no_threshold(models_dir: Path, cfg_name: str, symbol: str, month: str, now: pd.Timestamp) -> None:
+    """Record that ``month``'s training found no profitable threshold (it keeps the earlier model)."""
+    path = _marker(models_dir, cfg_name, symbol, month)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"month": month, "found_at": pd.Timestamp(now).isoformat(), "versions": library_versions()})
+    )
+
+
+def has_no_threshold(models_dir: Path, cfg_name: str, symbol: str, month: str) -> bool:
+    return _marker(models_dir, cfg_name, symbol, month).exists()
+
+
+def folder_for_month(models_dir: Path, cfg_name: str, symbol: str, month: str) -> Path | None:
+    """The artifact that decides bars opening in ``month``: the newest folder trained for it, else
+    (only if that month found no threshold) the newest earlier one; None if there is none yet."""
+    found = versions(models_dir, cfg_name, symbol)
+    same = [p for p in found if trades_month(p) == month]
+    if same:
+        return same[-1]
+    if has_no_threshold(models_dir, cfg_name, symbol, month):
+        earlier = [p for p in found if trades_month(p) < month]
+        return earlier[-1] if earlier else None
+    return None

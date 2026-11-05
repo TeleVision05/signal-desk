@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import plistlib
+import re
 import sqlite3
 from pathlib import Path
 
@@ -107,7 +108,7 @@ def test_monthly_retrain_job_is_scheduled_not_kept_alive(tmp_path):
     p = macos.retrain_plist(_plan(Path("/Users/demo")))
     assert macos.render(p).decode() == (SNAPSHOTS / "com.signaldesk.retrain.plist").read_text()
     assert p["ProgramArguments"][-1] == "retrain" and "KeepAlive" not in p and p["RunAtLoad"] is False
-    assert p["StartCalendarInterval"] == [{"Day": 1, "Hour": 6, "Minute": 30}, {"Day": 2, "Hour": 6, "Minute": 30}]
+    assert p["StartCalendarInterval"] == [{"Minute": 10}]  # every hour: see test_live_lgbm_month.py
     ran, said = [], []
     plan = _plan(tmp_path)
     assert macos.install(plan, run=lambda c: ran.append(c) or 0, out=said.append, uid=501) == 0
@@ -151,3 +152,35 @@ def test_trend_explanations_are_plain_and_match_the_decision():
     held = {"raw": 0.45, "score": 0.9, "vol": 0.5, "scale": 0.5}
     assert "keeps its position" in _explain("ETH", held, 0.4, 0.4, 0.2)
     assert _explain("ETH", held, 0.0, 0.45, 0.2).endswith("moves from 0% to 45% in ETH.")
+
+
+def test_a_second_backup_in_the_same_second_never_overwrites_the_first(monkeypatch):
+    said: list[str] = []
+    user = paths.user_books_path()
+    cli.install_books(use_default=False, dry_run=False, out=said.append)
+    first = json.loads(user.read_text())
+    first["starting_equity"] = 5000
+    user.write_text(json.dumps(first))
+    fixed = pd.Timestamp("2026-11-05 20:38:16", tz="UTC")
+    monkeypatch.setattr(cli, "_utc_now", lambda: fixed)
+    cli.install_books(use_default=True, dry_run=False, out=said.append)
+    user.write_text(user.read_text() + " ")  # edited again, then replaced again within the same second
+    cli.install_books(use_default=True, dry_run=False, out=said.append)
+    backups = sorted(user.parent.glob("books.json.bak-*"))
+    assert len(backups) == 2 and json.loads(backups[0].read_text()) == first
+
+
+def test_dry_run_does_not_claim_it_checks_the_scheduled_retrain_job(tmp_path):
+    said: list[str] = []
+    macos.install(_plan(tmp_path), dry_run=True, out=said.append, uid=501)
+    assert not any("Would check it is running" in s and macos.RETRAIN_LABEL in s for s in said)
+    assert any("Would check it is running" in s and macos.RUNNER_LABEL in s for s in said)
+    docs = (paths.REPO_ROOT / "docs/live_runner.md").read_text()
+    for name in ("retrain.jsonl", "train.jsonl", "install.jsonl", "retrain.{out,err}.log"):
+        assert name in docs
+
+
+def test_every_test_file_a_live_docstring_cites_exists():
+    src = paths.REPO_ROOT / "src/profit_engine/live"
+    cited = {m for f in src.rglob("*.py") for m in re.findall(r"tests/live/\w+\.py", f.read_text())}
+    assert cited and all((paths.REPO_ROOT / c).exists() for c in cited), sorted(cited)
