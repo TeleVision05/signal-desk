@@ -18,18 +18,29 @@ dependencies = [
 [project.scripts]
 profit-engine = "profit_engine.cli:main"
 signal-desk = "profit_engine.server:main"
+signal-desk-live = "profit_engine.live.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"profit_engine.live" = ["static/*.html"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# Ruff is scoped to the intraday harness for now: the older modules would need ~27 lint
+# Import the checked-out source (not whatever checkout the venv was `pip install -e`'d from).
+pythonpath = ["src"]
+# Ruff is scoped to the intraday harness and the live runner for now: the older modules would need ~27 lint
 # fixes and a 23-file reformat, which belongs in its own change.
 [tool.ruff]
 line-length = 120
 target-version = "py310"
-include = ["src/profit_engine/intraday/**/*.py", "tests/intraday/**/*.py"]
+include = [
+  "src/profit_engine/intraday/**/*.py",
+  "tests/intraday/**/*.py",
+  "src/profit_engine/live/**/*.py",
+  "tests/live/**/*.py",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "RUF", "PL", "NPY"]

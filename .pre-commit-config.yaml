@@ -1,5 +1,5 @@
 # Install once: .venv/bin/pre-commit install
-# Ruff is scoped to the intraday harness (see [tool.ruff] in pyproject.toml); the older
+# Ruff is scoped to the intraday harness and the live runner (see [tool.ruff] in pyproject.toml); the older
 # modules are not lint-clean yet and are excluded until a dedicated cleanup change.
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
@@ -7,14 +7,14 @@ repos:
     hooks:
       - id: ruff
         args: [--fix]
-        files: ^(src/profit_engine/intraday/|tests/intraday/)
+        files: ^(src/profit_engine/intraday/|tests/intraday/|src/profit_engine/live/|tests/live/)
       - id: ruff-format
-        files: ^(src/profit_engine/intraday/|tests/intraday/)
+        files: ^(src/profit_engine/intraday/|tests/intraday/|src/profit_engine/live/|tests/live/)
   - repo: local
     hooks:
       - id: pytest-intraday
-        name: pytest tests/intraday
-        entry: .venv/bin/python -m pytest -q tests/intraday
+        name: pytest tests/intraday tests/live
+        entry: .venv/bin/python -m pytest -q tests/intraday tests/live
         language: system
         pass_filenames: false
-        files: ^(src/profit_engine/intraday/|tests/intraday/|pyproject.toml|requirements.txt)
+        files: ^(src/profit_engine/intraday/|tests/intraday/|src/profit_engine/live/|tests/live/|config/live_books|pyproject.toml|requirements.txt)

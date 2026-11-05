@@ -1,0 +1,32 @@
+{
+  "cost_bps_per_side": 5.0,
+  "poll_seconds": 30,
+  "jitter": 0.1,
+  "max_daily_loss": 0.05,
+  "stale_after_bars": 2,
+  "max_price_jump": 0.25,
+  "settle_seconds": 2,
+  "starting_equity": 10000,
+  "notifications": true,
+  "notify_min_interval_s": 300,
+  "books": [
+    {
+      "book_id": "btc-demo-4h",
+      "title": "BTC demo trend (4h)",
+      "strategy": "demo_sma_trend",
+      "symbol": "BTCUSDT",
+      "timeframe": "4h",
+      "params": {"fast": 10, "slow": 30},
+      "enabled": true
+    },
+    {
+      "book_id": "eth-demo-4h",
+      "title": "ETH demo trend (4h)",
+      "strategy": "demo_sma_trend",
+      "symbol": "ETHUSDT",
+      "timeframe": "4h",
+      "params": {"fast": 10, "slow": 30},
+      "enabled": true
+    }
+  ]
+}
