@@ -131,16 +131,38 @@ def walk_forward_splits(
     return folds
 
 
+def _check_within(
+    index: pd.DatetimeIndex, t1: pd.Series | None, within: Fold | pd.Timestamp | None, allow_unpurged: bool, name: str
+) -> None:
+    """Fail fast on a missing ``t1``; with ``within``, raise if any row or label end reaches the
+    outer test block (tuning on OOS months). A row with an unknown label end (NaT) counts as reaching it."""
+    ends = _t1_array(index, t1, allow_unpurged)
+    if within is None:
+        return
+    block = within.test_start if isinstance(within, Fold) else pd.Timestamp(within)
+    late = (_ns(index) >= block.value) | (ends >= block.value)
+    if late.any():
+        raise ValueError(
+            f"{name}: {int(late.sum())} rows start or have labels ending at or after the outer test block "
+            f"({block}), first at {index[late.argmax()]}. Pass only the outer fold's training rows."
+        )
+
+
 def purged_kfold(
     index: pd.DatetimeIndex,
     t1: pd.Series | None,
     n_splits: int = 5,
     embargo: pd.Timedelta = DEFAULT_EMBARGO,
     allow_unpurged: bool = False,
+    within: Fold | pd.Timestamp | None = None,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
-    """Contiguous K-fold over ``index`` (pass only the outer training rows) with purge + embargo."""
+    """Contiguous K-fold over ``index`` (pass only the outer training rows) with purge + embargo.
+
+    ``within`` (an outer :class:`Fold` or its ``test_start``) makes misuse raise: every row and
+    every label end must be before the outer test block. Always pass it when tuning.
+    """
     assert_pre_holdout(index, "purged_kfold index")
-    _t1_array(index, t1, allow_unpurged)
+    _check_within(index, t1, within, allow_unpurged, "purged_kfold")
     n = len(index)
     if n_splits < 2 or n < n_splits:
         raise ValueError("need n_splits >= 2 and at least n_splits rows")
@@ -160,10 +182,14 @@ def purged_tail_split(
     t1: pd.Series | None,
     valid_frac: float = 0.2,
     allow_unpurged: bool = False,
+    within: Fold | pd.Timestamp | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Train on the first ``1 - valid_frac`` of rows, validate on the rest, purged at the seam."""
+    """Train on the first ``1 - valid_frac`` of rows, validate on the rest, purged at the seam.
+
+    ``within``: as in :func:`purged_kfold`.
+    """
     assert_pre_holdout(index, "purged_tail_split index")
-    _t1_array(index, t1, allow_unpurged)
+    _check_within(index, t1, within, allow_unpurged, "purged_tail_split")
     n = len(index)
     cut = int(n * (1 - valid_frac))
     if not 0 < cut < n:

@@ -16,7 +16,10 @@ Timing contract (the whole point of this module):
 ``target`` is a float or a Series on the bars' timestamps: every target timestamp inside the
 bars' span must be a bar open time (a tz-naive, shifted or integer index raises instead of
 silently becoming a flat book). Timestamps outside the span are ignored; bars with no target
-or a NaN target are flat.
+or a NaN target are flat. An infinite target raises (it is not "flat" and not in [0, 1]).
+
+Opens must be finite and positive (ValueError otherwise): drop missing bars, never reindex
+onto a full grid, or the NaN bars would hide the move and the gap flag across each hole.
 
 Gaps: ``span_bars`` is the open-to-next-open distance of each bar in units of the frame's
 bar length (inferred as the median step unless ``bar`` is given). A position held over a
@@ -30,10 +33,13 @@ next bar with volume, and the position held before it is carried meanwhile, so i
 halt move it was really exposed to. ``params`` counts ``n_stale_bars`` and ``fills_deferred``;
 the ledger flags trades held over a halted bar (``crosses_stale``). The forced exit on the last
 bar happens even if it is halted (``forced_exit_on_stale``). A frame without a ``volume``
-column has no halt detection (``params["stale_check"]`` is False).
+column has no halt detection (``params["stale_check"]`` is False). ``max_round_trips_per_day``
+and ``min_hold_bars`` apply to the fills that actually happen: a deferred entry counts on the
+day it fills and its holding period starts there.
 
-The bar index must be a tz-aware DatetimeIndex, strictly increasing (ValueError otherwise):
-an unsorted or duplicated frame would compute P&L across time-travelling "next opens".
+The bar index must be a UTC DatetimeIndex, strictly increasing (ValueError otherwise): an
+unsorted or duplicated frame would compute P&L across time-travelling "next opens", and a
+non-UTC zone would bucket the daily series by local days.
 
 Days are UTC calendar days; every day in the span appears in the daily series (0 when flat
 or when the exchange had no bars).
@@ -81,25 +87,36 @@ def _validate_target(df: pd.DataFrame, target: pd.Series | float) -> np.ndarray:
         raise TypeError("target must be a float or a pd.Series indexed by the bars' open times")
     _check_alignment(df.index, target.index)
     tgt = target.astype("float64").reindex(df.index).to_numpy()
-    finite = tgt[np.isfinite(tgt)]
-    if finite.size and (finite.min() < 0 or finite.max() > 1):
-        raise ValueError(f"long/flat only: target must be in [0, 1], got [{finite.min()}, {finite.max()}]")
+    if np.isinf(tgt).any():
+        first = df.index[np.isinf(tgt).argmax()]
+        raise ValueError(f"target must be finite or NaN (flat); got inf at {first} (e.g. vol targeting with rv == 0)")
+    known = tgt[~np.isnan(tgt)]
+    if known.size and (known.min() < 0 or known.max() > 1):
+        raise ValueError(f"long/flat only: target must be in [0, 1], got [{known.min()}, {known.max()}]")
     return np.nan_to_num(tgt, nan=0.0)
 
 
 def _check_index(idx: pd.Index) -> None:
-    if not isinstance(idx, pd.DatetimeIndex) or idx.tz is None:
-        raise ValueError(f"bars need a tz-aware DatetimeIndex, got {type(idx).__name__} tz={getattr(idx, 'tz', None)}")
+    if not isinstance(idx, pd.DatetimeIndex) or str(idx.tz) != "UTC":
+        raise ValueError(
+            f"bars need a UTC DatetimeIndex (daily P&L is bucketed by UTC day), got {type(idx).__name__} "
+            f"tz={getattr(idx, 'tz', None)}; use .tz_convert('UTC')"
+        )
     if not idx.is_monotonic_increasing or not idx.is_unique:
         raise ValueError("bars index must be strictly increasing (sorted, no duplicate timestamps)")
 
 
-def _defer_stale(held: np.ndarray, stale: np.ndarray) -> tuple[np.ndarray, int]:
-    """Carry the previous position over halted bars (no fill there). Returns (held, n_deferred)."""
-    out = held.copy()
-    for j in np.flatnonzero(stale[1:-1]) + 1:  # bar 0 is flat anyway; the last bar always exits
-        out[j] = out[j - 1]
-    return out, int((out != held).sum())
+def _check_opens(df: pd.DataFrame) -> np.ndarray:
+    """Fill prices must be real: a NaN open (a frame reindexed onto a full grid) would hide the
+    move across a data gap and the gap flags with it."""
+    opens = df["open"].to_numpy(dtype="float64")
+    bad = ~np.isfinite(opens) | (opens <= 0)
+    if bad.any():
+        raise ValueError(
+            f"{int(bad.sum())} bars have a missing or non-positive open, first at {df.index[bad.argmax()]}. "
+            "Drop missing bars instead of reindexing onto a full grid: the simulator flags gaps itself."
+        )
+    return opens
 
 
 def _drifted(h: np.ndarray, rel: np.ndarray) -> np.ndarray:
@@ -136,16 +153,26 @@ def _spans(idx: pd.DatetimeIndex, bar: pd.Timedelta | None) -> tuple[np.ndarray,
     return span, pd.Timedelta(bar_ns, "ns")
 
 
-def _apply_constraints(held: np.ndarray, day: np.ndarray, max_rt: int | None, min_hold: int) -> np.ndarray:
-    """Sequentially enforce min holding period and a per-UTC-day entry cap on executed positions."""
-    out = held.copy()
-    prev, bars_in, entries, cur_day = 0.0, 0, 0, None
+def _execute(
+    wanted: np.ndarray, stale: np.ndarray, day: np.ndarray, max_rt: int | None, min_hold: int
+) -> tuple[np.ndarray, int]:
+    """Executed positions, bar by bar: no fill on a halted bar (the position is carried), then a
+    per-UTC-day entry cap and a minimum holding period on the fills that actually happen.
+
+    One sequential pass, so a deferred entry counts against the day it fills on and the holding
+    period starts at the real entry bar. Returns ``(held, fills_deferred)``.
+    """
+    out = np.empty_like(wanted)
+    prev, bars_in, entries, cur_day, deferred = 0.0, 0, 0, None, 0
     last = len(out) - 1
     for j in range(len(out)):
         if day[j] != cur_day:
             cur_day, entries = day[j], 0
-        want = out[j]
-        if prev == 0 and want > 0:
+        want = wanted[j]
+        if stale[j] and 0 < j < last:  # halted: nothing fills here (the last bar always exits)
+            deferred += int(want != prev)
+            want = prev
+        elif prev == 0 and want > 0:
             if max_rt is not None and entries >= max_rt:
                 want = 0.0
             else:
@@ -154,7 +181,7 @@ def _apply_constraints(held: np.ndarray, day: np.ndarray, max_rt: int | None, mi
             want = prev
         bars_in = bars_in + 1 if want > 0 else 0
         out[j] = prev = want
-    return out
+    return out, deferred
 
 
 def _trade_ledger(
@@ -197,14 +224,12 @@ def _daily(idx: pd.DatetimeIndex, log_growth: np.ndarray) -> pd.Series:
 def _executed(
     df: pd.DataFrame, target: pd.Series | float, max_rt: int | None, min_hold: int
 ) -> tuple[np.ndarray, np.ndarray, dict]:
-    """Executed position per bar (target shifted one bar, constrained, halts deferred)."""
-    held = np.concatenate([[0.0], _validate_target(df, target)[:-1]])
-    held[-1] = 0.0  # no next open after the last bar: liquidate
-    if max_rt is not None or min_hold > 0:
-        held = _apply_constraints(held, df.index.floor("D").asi8, max_rt, min_hold)
+    """Executed position per bar (target shifted one bar, halts deferred, then constrained)."""
+    wanted = np.concatenate([[0.0], _validate_target(df, target)[:-1]])
+    wanted[-1] = 0.0  # no next open after the last bar: liquidate
     has_vol = "volume" in df.columns
     stale = (df["volume"].to_numpy(dtype="float64") <= 0) if has_vol else np.zeros(len(df), dtype=bool)
-    held, deferred = _defer_stale(held, stale)
+    held, deferred = _execute(wanted, stale, df.index.floor("D").asi8, max_rt, min_hold)
     info = {
         "stale_check": has_vol,
         "n_stale_bars": int(stale.sum()),
@@ -229,13 +254,15 @@ def run_backtest(
     _check_index(df.index)
     assert_pre_holdout(df.index, "run_backtest data")
     idx = df.index
-    opens = df["open"].to_numpy(dtype="float64")
+    opens = _check_opens(df)
     held, stale, stale_info = _executed(df, target, max_round_trips_per_day, min_hold_bars)
     weight, gross, cost = bar_pnl(held, opens, cost_bps_per_side / 1e4)
     span, bar_len = _spans(idx, bar)
     ret = np.zeros(len(df))
     ret[:-1] = opens[1:] / opens[:-1] - 1
     lg, ln = np.log1p(gross), np.log1p(gross) + np.log1p(-cost)
+    if not np.isfinite(ln).all():  # backstop: _daily's groupby-sum would turn NaN P&L into 0
+        raise ValueError(f"non-finite bar P&L at {idx[~np.isfinite(ln)][0]}; check prices and target")
     bars = pd.DataFrame(
         {
             "position": held,

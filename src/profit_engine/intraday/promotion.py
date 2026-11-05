@@ -7,8 +7,12 @@ benchmarks). The gate checks its own inputs: the base backtest must start inside
 (no holdout P&L, whether or not the holdout is open), the stress run must hold the same
 positions on the same bars, and ``bars`` must be the base backtest's bars (benchmarks are
 always computed on the base window, so a wider frame cannot flatter the strategy).
-The candidate must already be in the trial registry: the DSR uses the total distinct-run
-count across ALL families and PBO uses the registry's return matrix.
+The EVALUATED runs must already be in the trial registry: a base-cost record and a
+stress-cost record with the candidate's config and the hash of exactly these daily returns
+(a record of the same config name with other returns does not count). The DSR uses the total
+distinct-run count across ALL families and PBO uses the registry's return matrix, so an
+unlogged run would be missing from both. The gate always reads ``config.TRIALS_DIR``; the
+registry is not a parameter (tests monkeypatch it).
 
 ``evaluate`` refuses to run inside ``open_holdout``: it scores the walk-forward window only.
 The holdout has its own gate, :func:`holdout_check`.
@@ -29,6 +33,7 @@ from profit_engine.intraday.backtest import BacktestResult, buy_and_hold, vol_ma
 from profit_engine.intraday.holdout import HoldoutViolation, assert_pre_holdout, holdout_is_open
 from profit_engine.intraday.metrics import sharpe, summarize
 from profit_engine.intraday.overfitting import dsr_from_daily, pbo_cscv, permutation_test
+from profit_engine.intraday.provenance import data_hash
 
 COVERAGE_SLACK = config.COVERAGE_SLACK
 
@@ -47,16 +52,26 @@ def _row(symbol: str, name: str, value: float, rule: str, passed: bool) -> dict:
     return {"symbol": symbol, "criterion": name, "value": value, "threshold": rule, "pass": bool(passed)}
 
 
-def _registry_rows(c: Candidate, sym: str, base: BacktestResult, m: dict, trials_dir: Path | None) -> list[dict]:
-    cid = trials.config_id(c.family, c.params, c.timeframe, sym)
-    logged = cid in set(trials.load_trials(trials_dir).get("config_id", []))
-    n, var = trials.n_trials(trials_dir), trials.trial_sharpe_variance(trials_dir)
+def _run_logged(log: pd.DataFrame, cid: str, cost: float, daily: pd.Series) -> bool:
+    """A registry record of config ``cid`` at ``cost`` whose saved returns are exactly ``daily``."""
+    if log.empty or "returns_hash" not in log:
+        return False
+    hit = (log["config_id"] == cid) & (log["cost_bps_per_side"] == cost) & (log["returns_hash"] == data_hash(daily))
+    return bool(hit.any())
+
+
+def _registry_rows(c: Candidate, sym: str, base: BacktestResult, stress: BacktestResult, m: dict) -> list[dict]:
+    cid, log = trials.config_id(c.family, c.params, c.timeframe, sym), trials.load_trials()
+    base_ok = _run_logged(log, cid, config.BASE_COST_BPS, base.daily)
+    stress_ok = _run_logged(log, cid, config.STRESS_COST_BPS, stress.daily)
+    n, var = trials.n_trials(), trials.trial_sharpe_variance()
     dsr = dsr_from_daily(base.daily, n, var)
-    mat = trials.returns_matrix(sym, trials_dir)
+    mat = trials.returns_matrix(sym)
     pbo = pbo_cscv(mat)["pbo"] if mat.shape[1] >= 2 and len(mat) >= 32 else float("nan")
-    best = trials.best_baseline_sharpe(sym, trials_dir)
+    best = trials.best_baseline_sharpe(sym)
     return [
-        _row(sym, "logged in trial registry", float(logged), "== 1", logged),
+        _row(sym, "base run logged (returns hash)", float(base_ok), "config + 5bps + hash of base.daily", base_ok),
+        _row(sym, "stress run logged (returns hash)", float(stress_ok), "config + 10bps + hash", stress_ok),
         _row(sym, f"DSR (N={n} trials)", dsr, ">= 0.95", dsr >= 0.95),
         _row(sym, f"PBO ({mat.shape[1]} trials)", pbo, "<= 0.20", pbo <= 0.20),
         _row(
@@ -112,7 +127,7 @@ def _benchmark_rows(sym: str, base: BacktestResult, bars: pd.DataFrame, m: dict)
     ]
 
 
-def _symbol_rows(c: Candidate, sym: str, trials_dir: Path | None, n_perm: int, seed: int) -> list[dict]:
+def _symbol_rows(c: Candidate, sym: str, n_perm: int, seed: int) -> list[dict]:
     base, stress, bars = c.base[sym], c.stress[sym], c.bars[sym]
     m = summarize(base)
     perm = permutation_test(base, n_perm=n_perm, seed=seed)
@@ -133,12 +148,15 @@ def _symbol_rows(c: Candidate, sym: str, trials_dir: Path | None, n_perm: int, s
         _consistency_rows(sym, base, stress, bars)
         + rows
         + _benchmark_rows(sym, base, bars, m)
-        + _registry_rows(c, sym, base, m, trials_dir)
+        + _registry_rows(c, sym, base, stress, m)
     )
 
 
-def evaluate(candidate: Candidate, trials_dir: Path | None = None, n_perm: int = 500, seed: int = 0) -> pd.DataFrame:
-    """PASS/FAIL table (one row per symbol x criterion). Use :func:`verdict` for the overall call."""
+def evaluate(candidate: Candidate, n_perm: int = 500, seed: int = 0) -> pd.DataFrame:
+    """PASS/FAIL table (one row per symbol x criterion). Use :func:`verdict` for the overall call.
+
+    Reads the canonical registry ``config.TRIALS_DIR`` (not a parameter, so DSR N, PBO and the
+    best baseline always cover every trial ever logged)."""
     if holdout_is_open():
         raise HoldoutViolation(
             "promotion.evaluate scores the walk-forward window only; run it outside open_holdout "
@@ -150,7 +168,7 @@ def evaluate(candidate: Candidate, trials_dir: Path | None = None, n_perm: int =
         rows.append(_row(sym, "symbol evaluated", float(present), "BTCUSDT and ETHUSDT", present))
         if present:
             assert_pre_holdout(candidate.base[sym].daily.index, "promotion.evaluate")
-            rows += _symbol_rows(candidate, sym, trials_dir, n_perm, seed)
+            rows += _symbol_rows(candidate, sym, n_perm, seed)
     table = pd.DataFrame(rows)
     table["result"] = np.where(table["pass"], "PASS", "FAIL")
     return table

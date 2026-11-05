@@ -29,14 +29,14 @@ agents; `load_klines` only reads the cache, so agents never race on the download
 |---|---|---|
 | `data` | `load_klines(sym, start=TRAIN_START, end=HOLDOUT_START)` | index = bar OPEN time (UTC); closed bars only; no fabricated bars (gaps stay gaps) |
 | `resample` | `resample(df, "15m"/"1h"/"4h", incomplete=...)` | `label='left', closed='left'`, epoch-anchored. A bar missing any 5m sub-bar raises `IncompleteBarError` unless you pass `incomplete="drop"` or `"flag"` |
-| `features` | `make_feature_frame(primary, other, params=...)`, or each function | causal (value at `t` uses bars `<= t`), pure. Windows are in bars of the frame's timeframe |
+| `features` | `make_feature_frame(primary, other, params=...)`, or each function | causal (value at `t` uses bars `<= t`), pure. Windows are in bars of the frame's timeframe. Cross-asset inputs must have the same bar length (`ValueError` otherwise: a coarser bar's close would land on a finer bar that closes earlier) |
 | `labels` | `forward_return(df, h)`, `triple_barrier(df, h, pt, sl, vol_window)` | start at `open[t+1]`; return `t1` = when the label is known (for purging) |
-| `splits` | `walk_forward_splits(index, t1, ...)`, `purged_kfold`, `purged_tail_split` | monthly test blocks over 2020-01..2026-06. `t1` is REQUIRED (`None` raises unless `allow_unpurged=True`). Rows before a block are purged by `t1`; rows after it must start at or after the block's latest `t1` plus the embargo |
+| `splits` | `walk_forward_splits(index, t1, ...)`, `purged_kfold(..., within=fold)`, `purged_tail_split(..., within=fold)` | monthly test blocks over 2020-01..2026-06. `t1` is REQUIRED (`None` raises unless `allow_unpurged=True`). Rows before a block are purged by `t1`; rows after it must start at or after the block's latest `t1` plus the embargo. `within=fold` raises if any inner row or label end reaches the outer test block |
 | `backtest` | `run_backtest(df, target, cost_bps_per_side)`, `buy_and_hold`, `vol_matched_buy_and_hold` | `target[t]` decided at `t` close, filled at `t+1` open, P&L open-to-open. `target` must be a float or a Series on the bars' own timestamps |
 | `metrics` | `summarize(result)` | daily-P&L Sharpe (sqrt 365), Sortino, CAGR, MaxDD, PF, t-stats, months, years |
 | `overfitting` | `dsr_from_daily`, `pbo_cscv`, `permutation_test` | per-period (daily) Sharpe throughout |
 | `trials` | `log_trial(...)`, `n_trials()`, `returns_matrix()` | append-only JSONL + one parquet per call; counts RUNS (config x seed x code x data x returns); series must cover the whole OOS window |
-| `promotion` | `evaluate(Candidate)`, `verdict(table)`, `holdout_check(...)` | PASS only if every row passes on both symbols |
+| `promotion` | `evaluate(Candidate)`, `verdict(table)`, `holdout_check(...)` | PASS only if every row passes on both symbols. Always reads `config.TRIALS_DIR` (not a parameter) |
 | `holdout` | `open_holdout(reason=...)` | the only way past 2026-07-01; audited |
 
 ## Timing contract (read this before writing a strategy)
@@ -48,11 +48,15 @@ bar t+1: [open_{t+1} ...]                <- filled here, at open_{t+1}
 P&L of target[t] = open_{t+2} / open_{t+1} - 1   (minus cost on |Δposition|)
 ```
 
-* Targets must be in `[0, 1]` (long/flat; `ValueError` otherwise). `NaN` means flat.
+* Targets must be in `[0, 1]` (long/flat; `ValueError` otherwise). `NaN` means flat; `inf`
+  raises (guard your vol-targeting divisions against `rv == 0`).
+* Opens must be finite and positive. Drop missing bars; never `reindex` onto a full grid (the
+  NaN bars would hide the move and the gap flag across each hole), it raises.
 * A fill happens only when the target changes. Cost is `cost_bps_per_side / 1e4 * |target - drifted weight| * equity`
   at each fill (for 0/1 targets that is `|Δposition|`). Base 5, stress 10.
 * The last bar has no next open, so the book is forced flat there (exit cost charged).
-* `max_round_trips_per_day` and `min_hold_bars` are applied to executed positions.
+* `max_round_trips_per_day` and `min_hold_bars` are applied to executed positions, after halt
+  deferral: an entry counts on the UTC day it fills, and the hold starts at the real entry.
 * Between fills the book holds shares, so a fractional weight drifts with the price
   (`result.bars["weight"]`). A constant 0.5 target is a true 50% hold, not a free
   5-minute rebalance. Vol-targeting strategies that change the target every bar pay for
@@ -66,8 +70,9 @@ P&L of target[t] = open_{t+2} / open_{t+1} - 1   (minus cost on |Δposition|)
   the halt move it was really exposed to). See `params["n_stale_bars"]`,
   `params["fills_deferred"]` and the trade column `crosses_stale`. A frame without a
   `volume` column gets no halt detection (`params["stale_check"]` is False).
-* The bar index must be a tz-aware, strictly increasing DatetimeIndex. An unsorted or
-  duplicated frame (an unsorted `concat`) raises instead of inventing P&L.
+* The bar index must be a UTC, strictly increasing DatetimeIndex. An unsorted or
+  duplicated frame (an unsorted `concat`) raises instead of inventing P&L; a non-UTC zone
+  raises because it would bucket the daily series by local days.
 * Days are UTC calendar days; every day in the span is in `result.daily` (0 when flat).
 
 ## End-to-end example
@@ -96,7 +101,9 @@ def oos_positions(df, other):
     target = pd.Series(0.0, index=df.index)
     for fold in splits.walk_forward_splits(df.index, lab["t1"]):        # purged, monthly
         train, test = fold.train & has_x & has_y, fold.test & has_x
-        model = make_model(seed=SEED).fit(x[train], y[train])           # tune ONLY on x[train]
+        tr_idx = df.index[train]                                       # tune ONLY on these rows:
+        inner = splits.purged_kfold(tr_idx, lab["t1"][tr_idx], within=fold)  # raises if it reaches OOS
+        model = make_model(seed=SEED, cv=inner).fit(x[train], y[train])
         target[test] = (model.predict_proba(x[test])[:, 1] > PARAMS["threshold"]).astype(float)
     return target
 
@@ -146,8 +153,9 @@ print(table.to_string(index=False), promotion.verdict(table))
    the best of them, so the baseline agent should run first.
 4. **Fixed seeds.** Pass `random_state`/`seed` everywhere and log it.
 5. **Tune only inside training windows.** Thresholds, hyper-parameters, feature choices:
-   select them with `purged_kfold` / `purged_tail_split` on the rows of `fold.train`, never
-   by looking at OOS results. Choosing a threshold from the OOS table is a new trial; log it.
+   select them with `purged_kfold` / `purged_tail_split` on the rows of `fold.train`, with
+   `within=fold` (it raises if a row or label reaches the test block), never by looking at
+   OOS results. Choosing a threshold from the OOS table is a new trial; log it.
 6. **Do not drop incomplete bars silently.** Use `incomplete="drop"` knowingly (the sanity
    run shows how many) or `"flag"` and handle them.
 7. **Backtest the stitched OOS positions once** over `[EVAL_START, EVAL_END)`, not per fold.
@@ -174,7 +182,8 @@ Walk-forward OOS 2020-01-01..2026-06-30, each of BTCUSDT and ETHUSDT separately:
 | random-timing permutation p (same trades and gaps, shuffled order) | < 0.05 |
 | backtest starts in [2020-01-01, +7 days] and ends in [2026-06-24, 2026-07-01) | yes |
 | stress run holds the base positions on the same bars; `bars` equals the base bars | yes |
-| costs are 5 and 10, config is logged | yes |
+| costs are 5 and 10 | yes |
+| the evaluated base AND stress runs are logged (config + cost + hash of exactly these daily returns) | yes |
 
 Holdout (`promotion.holdout_check`, only inside `open_holdout`): net P&L > 0 and Sharpe
 >= 0.5 at 5 bps/side, both symbols, holdout-only data.

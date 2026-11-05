@@ -82,13 +82,17 @@ def test_promotion_fails_loudly_on_a_mediocre_candidate(isolated, bar_factory):
         df = bar_factory(n=288 * 40, seed=20 + i, start="2020-01-01")
         target = (df["close"].pct_change(12) > 0).astype(float)
         bars[sym], base[sym], stress[sym] = df, run_backtest(df, target, 5), run_backtest(df, target, 10)
-        # The 40-day backtest is too short for the registry (it must cover the OOS window);
-        # the "logged in trial registry" row only needs this config to be logged.
+        # The 40-day backtest is too short for the registry (it must cover the OOS window), so
+        # log the config with OTHER returns: the gate must not count that as the evaluated run.
         trials.log_trial("mom", {"h": 12}, "5m", sym, 5.0, summarize(base[sym]), _daily(30 + i), "h", 0)
     table = evaluate(Candidate("mom", {"h": 12}, "5m", base, stress, bars), n_perm=50)
     assert verdict(table) == "FAIL"
     assert set(table["symbol"]) == set(config.SYMBOLS)
-    for name in ("net Sharpe @5bps", "covers 2020-01..2026-06", "Sharpe vs best rule baseline"):
+    for name in (
+        "net Sharpe @5bps",
+        "covers 2020-01..2026-06",
+        "Sharpe vs best rule baseline",
+        "base run logged (returns hash)",
+    ):
         rows = table[table["criterion"] == name]
         assert len(rows) == 2 and not rows["pass"].any()
-    assert table[table["criterion"] == "logged in trial registry"]["pass"].all()

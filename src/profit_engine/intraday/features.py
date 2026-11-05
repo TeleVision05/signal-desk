@@ -95,12 +95,33 @@ def calendar(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def bar_length(df: pd.DataFrame) -> pd.Timedelta | None:
+    """The frame's bar length (median open-to-open step), or None with fewer than two bars."""
+    if len(df) < 2:
+        return None
+    return pd.Timedelta(int(np.median(np.diff(pd.DatetimeIndex(df.index).as_unit("ns").asi8))), "ns")
+
+
+def _check_same_bar_length(primary: pd.DataFrame, other: pd.DataFrame) -> None:
+    """Bars are stamped at their OPEN: joining a coarser bar onto a finer one attaches a close
+    that is known only after the finer bar has closed (e.g. a 1h close on a 5m bar: 55 min early).
+    """
+    a, b = bar_length(primary), bar_length(other)
+    if a is not None and b is not None and a != b:
+        raise ValueError(
+            f"cross-asset frames have different bar lengths ({a} vs {b}): joining on open time would "
+            "attach the coarser bar's future close. Resample both symbols to the same timeframe first."
+        )
+
+
 def cross_asset(df: pd.DataFrame, other: pd.DataFrame, horizons: tuple[int, ...] = (1, 12, 48)) -> pd.DataFrame:
     """Other symbol's ``x_ret_h`` and the spread ``rel_ret_h`` = own - other, on ``df``'s index.
 
     ``other`` is reindexed to ``df.index`` without filling, so a bar missing in ``other`` gives
     NaN rather than a stale or future value. Use :func:`make_feature_frame` to align first.
+    Both frames must have the same bar length (ValueError otherwise).
     """
+    _check_same_bar_length(df, other)
     own = _log_close(df)
     oth = _log_close(other).reindex(df.index)
     out = {}
@@ -124,7 +145,11 @@ FEATURES: dict[str, Callable[[pd.DataFrame], pd.DataFrame]] = {
 
 
 def align(primary: pd.DataFrame, other: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Restrict both frames to the bars they share (inner join on open time)."""
+    """Restrict both frames to the bars they share (inner join on open time).
+
+    Both frames must have the same bar length (ValueError otherwise; see :func:`cross_asset`).
+    """
+    _check_same_bar_length(primary, other)
     idx = primary.index.intersection(other.index)
     return primary.loc[idx], other.loc[idx]
 

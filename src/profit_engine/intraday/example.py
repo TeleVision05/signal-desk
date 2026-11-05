@@ -4,8 +4,9 @@
     python -m profit_engine.intraday.example --trials-dir /tmp/demo_trials
 
 ``--trials-dir`` defaults to a throwaway directory so the demo never pollutes the real
-registry. A real experiment omits it (writes research/intraday/trials/) and logs EVERY
-configuration it tries, including the ones that lose.
+registry: the demo points ``config.TRIALS_DIR`` at it, because ``promotion.evaluate`` always
+reads ``config.TRIALS_DIR``. A real experiment never changes it (writes
+research/intraday/trials/) and logs EVERY configuration it tries, including the ones that lose.
 """
 
 from __future__ import annotations
@@ -54,7 +55,7 @@ def oos_positions(bars: pd.DataFrame, other: pd.DataFrame) -> pd.Series:
     return target
 
 
-def run_symbol(sym: str, bars: dict[str, pd.DataFrame], raw_hash: str, trials_dir: Path) -> tuple:
+def run_symbol(sym: str, bars: dict[str, pd.DataFrame], raw_hash: str) -> tuple:
     other = bars["ETHUSDT" if sym == "BTCUSDT" else "BTCUSDT"]
     target = oos_positions(bars[sym], other)
     in_oos = (target.index >= config.EVAL_START) & (target.index < config.EVAL_END)
@@ -63,9 +64,7 @@ def run_symbol(sym: str, bars: dict[str, pd.DataFrame], raw_hash: str, trials_di
     stress = backtest.run_backtest(oos_bars, oos_target, config.STRESS_COST_BPS)
     for res in (base, stress):
         m = metrics.summarize(res)
-        trials.log_trial(
-            FAMILY, PARAMS, TIMEFRAME, sym, res.cost_bps_per_side, m, res.daily, raw_hash, SEED, trials_dir=trials_dir
-        )
+        trials.log_trial(FAMILY, PARAMS, TIMEFRAME, sym, res.cost_bps_per_side, m, res.daily, raw_hash, SEED)
     print(metrics.one_line(f"{sym} {FAMILY} @5bps", metrics.summarize(base)))
     return base, stress, oos_bars
 
@@ -75,9 +74,10 @@ def main() -> None:
     ap.add_argument("--trials-dir", type=Path, default=None)
     args = ap.parse_args()
     trials_dir = args.trials_dir or Path(tempfile.mkdtemp(prefix="intraday_demo_"))
+    config.TRIALS_DIR = trials_dir  # demo only: keep the demo's runs out of the real registry
     raw = {s: data.load_klines(s) for s in config.SYMBOLS}  # [TRAIN_START, HOLDOUT_START) only
     bars = {s: resample(df, TIMEFRAME, incomplete="drop") for s, df in raw.items()}
-    out = {s: run_symbol(s, bars, data_hash(raw[s]), trials_dir) for s in config.SYMBOLS}
+    out = {s: run_symbol(s, bars, data_hash(raw[s])) for s in config.SYMBOLS}
     cand = promotion.Candidate(
         FAMILY,
         PARAMS,
@@ -86,7 +86,7 @@ def main() -> None:
         stress={s: o[1] for s, o in out.items()},
         bars={s: o[2] for s, o in out.items()},
     )
-    table = promotion.evaluate(cand, trials_dir=trials_dir, n_perm=200, seed=SEED)
+    table = promotion.evaluate(cand, n_perm=200, seed=SEED)
     with pd.option_context("display.width", 200, "display.max_rows", 100):
         print(table.to_string(index=False))
     print("VERDICT:", promotion.verdict(table), "| registry:", trials_dir)
