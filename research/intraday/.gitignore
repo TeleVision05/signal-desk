@@ -1,0 +1,3 @@
+# Daily OOS return series per trial: large, regenerable, never committed.
+trials/returns/
+*.parquet

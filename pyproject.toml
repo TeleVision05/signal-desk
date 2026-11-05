@@ -24,3 +24,16 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Ruff is scoped to the intraday harness for now: the older modules would need ~27 lint
+# fixes and a 23-file reformat, which belongs in its own change.
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+include = ["src/profit_engine/intraday/**/*.py", "tests/intraday/**/*.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "RUF", "PL", "NPY"]
+ignore = ["PLR0913", "PLR2004", "PLR0915", "RUF002", "RUF003", "N818"]
+
+[tool.ruff.lint.pylint]
+max-args = 12

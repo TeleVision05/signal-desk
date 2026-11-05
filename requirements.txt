@@ -1,11 +1,23 @@
 yfinance>=0.2.40
-pandas>=2.2.0
-numpy>=1.26.0
 requests>=2.31.0
-scikit-learn>=1.4.0
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 apscheduler>=3.10.4
 python-multipart>=0.0.9
 pytest>=8.0.0
 psycopg[binary]>=3.2.0
+
+# Pinned exactly: pickled/joblib model artifacts (sklearn, LightGBM) are only guaranteed to
+# load under the same numpy/pandas/scikit-learn versions that wrote them. Bump together,
+# and retrain/re-export any saved model when you do. numpy 2.5 needs Python >= 3.12.
+numpy==2.5.4
+pandas==3.0.6
+scikit-learn==1.9.1
+
+# Intraday research harness (src/profit_engine/intraday)
+pyarrow==26.0.1
+lightgbm==4.7.0
+
+# Tooling (pre-commit runs ruff + the intraday tests)
+ruff==0.17.3
+pre-commit==4.7.0
