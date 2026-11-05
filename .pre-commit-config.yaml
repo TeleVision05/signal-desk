@@ -1,0 +1,20 @@
+# Install once: .venv/bin/pre-commit install
+# Ruff is scoped to the paper-book files (see [tool.ruff] in pyproject.toml); the older modules are not
+# lint-clean yet and are excluded until a dedicated cleanup change.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.3
+    hooks:
+      - id: ruff
+        args: [--fix]
+        files: ^(src/profit_engine/paper_step\.py|src/profit_engine/paper_ml\.py|src/profit_engine/paper_ml_crypto\.py|tests/test_paper_step\.py)$
+      - id: ruff-format
+        files: ^(src/profit_engine/paper_step\.py|src/profit_engine/paper_ml\.py|src/profit_engine/paper_ml_crypto\.py|tests/test_paper_step\.py)$
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest tests
+        entry: .venv/bin/python -m pytest -q tests
+        language: system
+        pass_filenames: false
+        files: ^(src/|tests/|pyproject.toml|requirements.txt)

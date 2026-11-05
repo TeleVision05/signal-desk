@@ -180,6 +180,25 @@ class PaperLedger:
             ).fetchone()
             return float(row["price"]) if row else None
 
+    def last_buy(self, run_id: str) -> tuple[float, str] | None:
+        """(price, ts) of the newest BUY fill, so a trailing stop can find the high since entry."""
+        if self._url:
+            with self._pg_conn() as conn:
+                row = conn.execute(
+                    "SELECT price, ts FROM paper_fills WHERE run_id = %s AND side = 'BUY' ORDER BY id DESC LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+        else:
+            with self._sqlite_conn() as conn:
+                row = conn.execute(
+                    "SELECT price, ts FROM fills WHERE run_id=? AND side='BUY' ORDER BY id DESC LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+        if row is None:
+            return None
+        ts = row["ts"]
+        return float(row["price"]), ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+
     def apply_fill(
         self,
         run_id: str,

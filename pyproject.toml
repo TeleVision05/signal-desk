@@ -24,3 +24,22 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+# Scoped to the files this change touched; the older modules are not lint-clean yet.
+include = [
+  "src/profit_engine/paper_step.py",
+  "src/profit_engine/paper_ml.py",
+  "src/profit_engine/paper_ml_crypto.py",
+  "tests/test_paper_step.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "RUF", "PL", "NPY"]
+ignore = ["PLR0913", "PLR2004", "PLR0915", "RUF002", "RUF003", "N818"]
+
+[tool.ruff.lint.pylint]
+max-args = 12
