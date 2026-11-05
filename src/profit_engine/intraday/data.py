@@ -201,7 +201,10 @@ def sync_cache(
         if raw is None:
             raw, source = _download(symbol, config.TRAIN_START - pd.Timedelta(days=31), now, session), "archive"
         base, stats = normalize_raw(raw, now)
-    top_raw = _download(symbol, base.index[-1] + config.BAR, now, session)
+    # Re-fetch the last bar we hold, not just what follows it. A seed dump may have captured
+    # its final bar mid-bar; judged against today's `now` it looks closed and would be kept
+    # forever. The REST copy (fetched now, closed) replaces it via keep="last" below.
+    top_raw = _download(symbol, base.index[-1], now, session)
     if len(top_raw):
         top, top_stats = normalize_raw(top_raw, now)
         stats = {k: stats[k] + top_stats[k] for k in stats}

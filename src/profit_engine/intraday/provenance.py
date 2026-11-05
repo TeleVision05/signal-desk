@@ -10,26 +10,27 @@ import pandas as pd
 from profit_engine.intraday import config
 
 
+def _git(*args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=config.REPO_ROOT, capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
 def git_sha() -> str:
-    """HEAD sha, suffixed with ``-dirty`` when tracked files have uncommitted changes."""
+    """HEAD sha; with uncommitted changes to tracked files, ``<sha>-dirty-<hash of the diff>``.
+
+    The diff hash makes two different uncommitted code states two different code versions
+    in the trial registry. Untracked files are not covered: commit experiment code.
+    """
     try:
-        sha = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=config.REPO_ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-        dirty = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=no"],
-            cwd=config.REPO_ROOT,
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
+        sha = _git("rev-parse", "HEAD")
+        dirty = _git("status", "--porcelain", "--untracked-files=no")
+        diff = _git("diff", "HEAD", "--no-ext-diff") if dirty else ""
     except (OSError, subprocess.CalledProcessError):
         return "unknown"
-    return f"{sha}-dirty" if dirty else sha
+    if not dirty:
+        return sha
+    return f"{sha}-dirty-{hashlib.sha256(diff.encode()).hexdigest()[:8]}"
 
 
 def data_hash(df: pd.DataFrame | pd.Series) -> str:

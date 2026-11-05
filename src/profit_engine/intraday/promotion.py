@@ -2,8 +2,12 @@
 
 Inputs are walk-forward OOS backtests over ``[EVAL_START, EVAL_END)`` at base (5 bps/side)
 and stress (10 bps/side) cost, plus the bar frames they ran on (for the buy-and-hold
-benchmarks). The candidate must already be in the trial registry: the DSR uses the total
-distinct-trial count across ALL families and PBO uses the registry's return matrix.
+benchmarks). The gate checks its own inputs: the base backtest must start inside
+``[EVAL_START, EVAL_START + 7D]`` (no pre-2020 P&L), the stress run must hold the same
+positions on the same bars, and ``bars`` must be the base backtest's bars (benchmarks are
+always computed on the base window, so a wider frame cannot flatter the strategy).
+The candidate must already be in the trial registry: the DSR uses the total distinct-run
+count across ALL families and PBO uses the registry's return matrix.
 """
 
 from __future__ import annotations
@@ -32,7 +36,7 @@ class Candidate:
     timeframe: str
     base: dict[str, BacktestResult]  # symbol -> OOS backtest at BASE_COST_BPS
     stress: dict[str, BacktestResult]  # symbol -> same positions at STRESS_COST_BPS
-    bars: dict[str, pd.DataFrame]  # symbol -> the OOS bar frame the backtests ran on
+    bars: dict[str, pd.DataFrame]  # symbol -> the EXACT bar frame base/stress ran on (checked)
 
 
 def _row(symbol: str, name: str, value: float, rule: str, passed: bool) -> dict:
@@ -61,17 +65,18 @@ def _registry_rows(c: Candidate, sym: str, base: BacktestResult, m: dict, trials
     ]
 
 
-def _symbol_rows(c: Candidate, sym: str, trials_dir: Path | None, n_perm: int, seed: int) -> list[dict]:
-    base, stress, bars = c.base[sym], c.stress[sym], c.bars[sym]
-    m = summarize(base)
-    start, end = base.daily.index[0], base.daily.index[-1]
-    covers = start <= config.EVAL_START + COVERAGE_SLACK and end >= config.EVAL_END - COVERAGE_SLACK
-    bh = summarize(buy_and_hold(bars, config.BASE_COST_BPS))
-    vm, w = vol_matched_buy_and_hold(bars, base.daily, config.BASE_COST_BPS)
-    perm = permutation_test(base, n_perm=n_perm, seed=seed)
-    t_best = max(m["t_net_bps"], m["t_daily"])
-    rows = [
-        _row(sym, "covers 2020-01..2026-06", float(covers), f"{start.date()}..{end.date()}", covers),
+def _consistency_rows(sym: str, base: BacktestResult, stress: BacktestResult, bars: pd.DataFrame) -> list[dict]:
+    """The stress run and the benchmark bars must belong to the base backtest, bar for bar."""
+    first, last = base.bars.index[0], base.bars.index[-1]
+    covers = config.EVAL_START <= first <= config.EVAL_START + COVERAGE_SLACK and last >= (
+        config.EVAL_END - COVERAGE_SLACK
+    )
+    same_stress = stress.bars.index.equals(base.bars.index) and np.array_equal(
+        stress.bars["position"].to_numpy(), base.bars["position"].to_numpy()
+    )
+    same_bars = bars.index.equals(base.bars.index)
+    return [
+        _row(sym, "covers 2020-01..2026-06", float(covers), f"{first}..{last}", covers),
         _row(
             sym,
             "costs are 5 / 10 bps per side",
@@ -79,6 +84,37 @@ def _symbol_rows(c: Candidate, sym: str, trials_dir: Path | None, n_perm: int, s
             "5 & 10",
             base.cost_bps_per_side == config.BASE_COST_BPS and stress.cost_bps_per_side == config.STRESS_COST_BPS,
         ),
+        _row(sym, "stress run holds base positions", float(same_stress), "same index & positions", same_stress),
+        _row(sym, "benchmark bars match backtest bars", float(same_bars), "bars.index == base index", same_bars),
+    ]
+
+
+def _benchmark_rows(sym: str, base: BacktestResult, bars: pd.DataFrame, m: dict) -> list[dict]:
+    """Buy-and-hold benchmarks on the base backtest's own window (never a wider frame)."""
+    first, last = base.bars.index[0], base.bars.index[-1]
+    window = bars[(bars.index >= first) & (bars.index <= last)]
+    if len(window) < 2:
+        raise ValueError(f"Candidate.bars[{sym!r}] does not cover the base backtest window {first}..{last}")
+    bh = summarize(buy_and_hold(window, config.BASE_COST_BPS))
+    vm, w = vol_matched_buy_and_hold(window, base.daily, config.BASE_COST_BPS)
+    return [
+        _row(sym, "Sharpe vs buy-and-hold", m["sharpe"] - bh["sharpe"], "> 0", m["sharpe"] > bh["sharpe"]),
+        _row(
+            sym,
+            f"Sharpe vs vol-matched B&H (w={w:.2f})",
+            m["sharpe"] - sharpe(vm.daily),
+            "> 0",
+            m["sharpe"] > sharpe(vm.daily),
+        ),
+    ]
+
+
+def _symbol_rows(c: Candidate, sym: str, trials_dir: Path | None, n_perm: int, seed: int) -> list[dict]:
+    base, stress, bars = c.base[sym], c.stress[sym], c.bars[sym]
+    m = summarize(base)
+    perm = permutation_test(base, n_perm=n_perm, seed=seed)
+    t_best = max(m["t_net_bps"], m["t_daily"])
+    rows = [
         _row(sym, "net Sharpe @5bps", m["sharpe"], ">= 1.0", m["sharpe"] >= 1.0),
         _row(sym, "net Sharpe @10bps", sharpe(stress.daily), "> 0", sharpe(stress.daily) > 0),
         _row(sym, "OOS trades", m["n_trades"], ">= 500", m["n_trades"] >= 500),
@@ -88,17 +124,14 @@ def _symbol_rows(c: Candidate, sym: str, trials_dir: Path | None, n_perm: int, s
         _row(sym, "positive months", m["pct_positive_months"], ">= 60%", m["pct_positive_months"] >= 0.60),
         _row(sym, "worst calendar year", m["worst_year"], ">= -10%", m["worst_year"] >= -0.10),
         _row(sym, "best month share of P&L", m["best_month_share"], "< 30%", m["best_month_share"] < 0.30),
-        _row(sym, "Sharpe vs buy-and-hold", m["sharpe"] - bh["sharpe"], "> 0", m["sharpe"] > bh["sharpe"]),
-        _row(
-            sym,
-            f"Sharpe vs vol-matched B&H (w={w:.2f})",
-            m["sharpe"] - sharpe(vm.daily),
-            "> 0",
-            m["sharpe"] > sharpe(vm.daily),
-        ),
         _row(sym, "random-timing permutation p", perm["p_value"], "< 0.05", perm["p_value"] < 0.05),
     ]
-    return rows + _registry_rows(c, sym, base, m, trials_dir)
+    return (
+        _consistency_rows(sym, base, stress, bars)
+        + rows
+        + _benchmark_rows(sym, base, bars, m)
+        + _registry_rows(c, sym, base, m, trials_dir)
+    )
 
 
 def evaluate(candidate: Candidate, trials_dir: Path | None = None, n_perm: int = 500, seed: int = 0) -> pd.DataFrame:
@@ -119,8 +152,11 @@ def verdict(table: pd.DataFrame) -> str:
     return "PASS" if bool(table["pass"].all()) else "FAIL"
 
 
-def holdout_check(results: dict[str, BacktestResult], audit_log: Path | None = None) -> pd.DataFrame:
-    """Holdout gate (net P&L > 0 and Sharpe >= 0.5 at base cost). Only inside ``open_holdout``."""
+def holdout_check(results: dict[str, BacktestResult]) -> pd.DataFrame:
+    """Holdout gate (net P&L > 0 and Sharpe >= 0.5 at base cost). Only inside ``open_holdout``.
+
+    The verdict is appended to ``config.HOLDOUT_AUDIT_LOG``; the path is not a parameter.
+    """
     if not holdout_is_open():
         raise HoldoutViolation("holdout_check must run inside `with open_holdout(reason=...)`")
     rows = []
@@ -140,7 +176,7 @@ def holdout_check(results: dict[str, BacktestResult], audit_log: Path | None = N
             ]
     table = pd.DataFrame(rows)
     table["result"] = np.where(table["pass"], "PASS", "FAIL")
-    path = Path(audit_log or config.HOLDOUT_AUDIT_LOG)
+    path = Path(config.HOLDOUT_AUDIT_LOG)
     with path.open("a", encoding="utf-8") as fh:
         record = {
             "ts": datetime.now(timezone.utc).isoformat(),

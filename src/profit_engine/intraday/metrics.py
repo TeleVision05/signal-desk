@@ -15,7 +15,14 @@ from profit_engine.intraday.holdout import assert_pre_holdout
 ANN = np.sqrt(config.PERIODS_PER_YEAR)
 
 
+def _guard(daily: pd.Series, what: str) -> None:
+    """Every public helper refuses post-holdout dates (a result built inside open_holdout
+    and analysed after it closed included)."""
+    assert_pre_holdout(daily.index, f"metrics.{what}")
+
+
 def sharpe(daily: pd.Series, annualize: bool = True) -> float:
+    _guard(daily, "sharpe")
     sd = daily.std(ddof=1)
     if not np.isfinite(sd) or sd == 0:
         return 0.0
@@ -24,17 +31,20 @@ def sharpe(daily: pd.Series, annualize: bool = True) -> float:
 
 
 def sortino(daily: pd.Series) -> float:
+    _guard(daily, "sortino")
     downside = np.sqrt(np.mean(np.minimum(daily.to_numpy(), 0.0) ** 2))
     return float(daily.mean() / downside * ANN) if downside > 0 else 0.0
 
 
 def cagr(daily: pd.Series) -> float:
+    _guard(daily, "cagr")
     growth = float(np.prod(1 + daily.to_numpy()))
     years = len(daily) / config.PERIODS_PER_YEAR
     return growth ** (1 / years) - 1 if years > 0 and growth > 0 else -1.0
 
 
 def max_drawdown(daily: pd.Series) -> float:
+    _guard(daily, "max_drawdown")
     eq = np.cumprod(1 + daily.to_numpy())
     peak = np.maximum.accumulate(np.concatenate([[1.0], eq]))[1:]
     return float((eq / peak - 1).min()) if len(eq) else 0.0
@@ -48,24 +58,29 @@ def t_stat(x: np.ndarray) -> float:
 
 
 def monthly_returns(daily: pd.Series) -> pd.Series:
+    _guard(daily, "monthly_returns")
     naive = daily.copy()
     naive.index = naive.index.tz_localize(None)
     return (1 + naive).groupby(naive.index.to_period("M")).prod() - 1
 
 
 def yearly_returns(daily: pd.Series) -> dict[int, float]:
+    _guard(daily, "yearly_returns")
     yearly = (1 + daily).groupby(daily.index.year).prod() - 1
     return {int(y): float(r) for y, r in yearly.items()}
 
 
 def best_month_share(daily: pd.Series) -> float:
     """Best month's log P&L / total log P&L. inf when total P&L <= 0 (always fails a < cap)."""
+    _guard(daily, "best_month_share")
     lm = np.log1p(monthly_returns(daily))
     total = lm.sum()
     return float(lm.max() / total) if total > 0 else float("inf")
 
 
 def trade_stats(trades: pd.DataFrame) -> dict:
+    if "exit_time" in trades and len(trades):
+        assert_pre_holdout(pd.DatetimeIndex(trades["exit_time"]), "metrics.trade_stats")
     if trades.empty:
         return {
             "n_trades": 0,

@@ -12,6 +12,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from profit_engine.intraday.holdout import assert_pre_holdout
+
 
 def _shift(values: np.ndarray, k: int, fill: float = np.nan) -> np.ndarray:
     """values[t + k] at position t (k >= 0), ``fill`` past the end."""
@@ -30,6 +32,7 @@ def forward_return(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
     """``ret`` = log(open[t+1+h] / open[t+1]); ``t1`` = open time of bar t+1+h."""
     if horizon < 1:
         raise ValueError("horizon must be >= 1 bar")
+    assert_pre_holdout(df.index, "labels.forward_return")
     o = df["open"].to_numpy(dtype="float64")
     ret = np.log(_shift(o, 1 + horizon) / _shift(o, 1))
     return pd.DataFrame({"ret": ret, "t1": _shift_index(df.index, 1 + horizon)}, index=df.index)
@@ -57,6 +60,7 @@ def triple_barrier(
     that open. Columns: ``label`` (+1 profit-take, -1 stop, 0 vertical), ``ret`` (log return
     realised), ``barrier`` ("pt"/"sl"/"vb"), ``sigma``, ``t1``.
     """
+    assert_pre_holdout(df.index, "labels.triple_barrier")
     n = len(df)
     o, hi, lo = (df[c].to_numpy(dtype="float64") for c in ("open", "high", "low"))
     sigma = ex_ante_sigma(df, vol_window, horizon).to_numpy()

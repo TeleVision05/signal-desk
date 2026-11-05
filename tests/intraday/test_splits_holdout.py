@@ -53,7 +53,12 @@ def test_e_unknown_label_end_is_purged():
 def test_e_rolling_window():
     idx = _hourly("2019-01-01", "2020-03-01")
     folds = walk_forward_splits(
-        idx, None, train="rolling", train_window=pd.DateOffset(months=2), eval_end=pd.Timestamp("2020-03-01", tz="UTC")
+        idx,
+        None,
+        train="rolling",
+        train_window=pd.DateOffset(months=2),
+        eval_end=pd.Timestamp("2020-03-01", tz="UTC"),
+        allow_unpurged=True,
     )
     first_train = idx[folds[0].train]
     assert first_train[0] == pd.Timestamp("2019-11-01", tz="UTC")
@@ -102,7 +107,8 @@ def test_f_guard_raises_everywhere(isolated, bar_factory):
     with pytest.raises(HoldoutViolation):
         data.load_klines("BTCUSDT", end="2026-07-02")
     with pytest.raises(HoldoutViolation):
-        walk_forward_splits(df.index, None, eval_end=pd.Timestamp("2026-08-01", tz="UTC"))
+        t1 = pd.Series(df.index, index=df.index).shift(-4)  # not via labels: that raises first
+        walk_forward_splits(df.index, t1, eval_end=pd.Timestamp("2026-08-01", tz="UTC"))
     with pytest.raises(HoldoutViolation):
         run_backtest(df, 1.0)
     with pytest.raises(HoldoutViolation):

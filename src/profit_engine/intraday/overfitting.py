@@ -14,7 +14,8 @@ from statistics import NormalDist
 import numpy as np
 import pandas as pd
 
-from profit_engine.intraday.backtest import BacktestResult
+from profit_engine.intraday.backtest import BacktestResult, bar_pnl
+from profit_engine.intraday.holdout import assert_pre_holdout
 
 EULER_GAMMA = 0.5772156649015329
 _N = NormalDist()
@@ -45,6 +46,7 @@ def deflated_sharpe_ratio(
 
 
 def dsr_from_daily(daily: pd.Series, n_trials: int, var_trial_sharpe: float) -> float:
+    assert_pre_holdout(daily.index, "overfitting.dsr_from_daily")
     x = daily.to_numpy(dtype="float64")
     sd = x.std(ddof=1)
     sr = x.mean() / sd if sd > 0 else 0.0
@@ -67,6 +69,8 @@ def pbo_cscv(returns: pd.DataFrame | np.ndarray, n_blocks: int = 16, chunk: int 
     Returns ``{"pbo", "logits", "n_combinations", "n_trials"}``. PBO is the share of IS/OOS
     splits where the in-sample best trial ranks at or below the OOS median.
     """
+    if isinstance(returns, pd.DataFrame):
+        assert_pre_holdout(returns.index, "overfitting.pbo_cscv")
     m = np.asarray(returns, dtype="float64")
     t, n = m.shape
     if n < 2 or n_blocks % 2 or t < 2 * n_blocks:
@@ -103,9 +107,10 @@ def _segments(held: np.ndarray) -> tuple[list[np.ndarray], list[int]]:
     return trades, gaps
 
 
-def _daily_sharpe(held: np.ndarray, ret: np.ndarray, c: float, day: np.ndarray, n_days: int) -> float:
-    dpos = np.abs(np.diff(np.concatenate([[0.0], held])))
-    ln = np.log1p(held * ret) + np.log1p(-c * dpos)
+def _daily_sharpe(held: np.ndarray, price: np.ndarray, c: float, day: np.ndarray, n_days: int) -> float:
+    """Daily Sharpe of ``held`` under exactly the simulator's P&L model (:func:`bar_pnl`)."""
+    _, gross, cost = bar_pnl(held, price, c)
+    ln = np.log1p(gross) + np.log1p(-cost)
     daily = np.expm1(np.bincount(day, weights=ln, minlength=n_days))
     sd = daily.std(ddof=1)
     return float(daily.mean() / sd) if sd > 0 else 0.0
@@ -119,11 +124,13 @@ def permutation_test(result: BacktestResult, n_perm: int = 500, seed: int = 0) -
     ``{"p_value", "sharpe_daily", "null_mean", "null_p95", "n_perm"}``.
     """
     bars = result.bars
+    assert_pre_holdout(bars.index, "overfitting.permutation_test")
     held, ret = bars["position"].to_numpy(), bars["ret"].to_numpy()
+    price = np.concatenate([[1.0], np.cumprod(1 + ret[:-1])])  # proportional to the opens
     days = bars.index.floor("D")
     day = ((days - days[0]) // pd.Timedelta("1D")).to_numpy().astype("int64")
     n_days, c = int(day[-1]) + 1, result.cost_bps_per_side / 1e4
-    actual = _daily_sharpe(held, ret, c, day, n_days)
+    actual = _daily_sharpe(held, price, c, day, n_days)
     trades, gaps = _segments(held)
     rng = np.random.default_rng(seed)
     null = np.empty(n_perm)
@@ -132,7 +139,7 @@ def permutation_test(result: BacktestResult, n_perm: int = 500, seed: int = 0) -
         pieces = [np.zeros(gaps[order_g[0]])]
         for j, ti in enumerate(order_t):
             pieces += [trades[ti], np.zeros(gaps[order_g[j + 1]])]
-        null[i] = _daily_sharpe(np.concatenate(pieces), ret, c, day, n_days)
+        null[i] = _daily_sharpe(np.concatenate(pieces), price, c, day, n_days)
     return {
         "p_value": float((1 + (null >= actual).sum()) / (1 + n_perm)),
         "sharpe_daily": actual,

@@ -1,11 +1,18 @@
 """Holdout guard.
 
-Every loader, splitter, simulator, metric and promotion entry point calls
-:func:`assert_pre_holdout` on the timestamps it is about to touch. It raises
-:class:`HoldoutViolation` for anything at or after ``HOLDOUT_START`` unless the
-caller is inside ``with open_holdout(reason=...)``, which first appends an audit
-record (UTC timestamp, reason, caller file:line:function, git sha) to
-``research/intraday/holdout_access.jsonl``.
+These entry points call :func:`assert_pre_holdout` on the timestamps they are about to
+touch: ``data.load_klines``; ``labels.forward_return`` / ``triple_barrier``; ``splits``
+``walk_forward_splits`` / ``purged_kfold`` / ``purged_tail_split``; ``backtest.run_backtest``;
+every public ``metrics`` helper and ``summarize``; ``overfitting.dsr_from_daily`` /
+``pbo_cscv`` (DataFrame input) / ``permutation_test``; ``trials.log_trial``; ``promotion``.
+They raise :class:`HoldoutViolation` for anything at or after ``HOLDOUT_START`` unless the
+caller is inside ``with open_holdout(reason=...)``, which first appends an audit record
+(UTC timestamp, reason, caller file:line:function, git sha) to
+``config.HOLDOUT_AUDIT_LOG`` (``research/intraday/holdout_access.jsonl``). The path is not
+a parameter: tests isolate it by monkeypatching ``config.HOLDOUT_AUDIT_LOG``.
+
+Not guarded (raw plumbing, not scoring): ``binance.*`` downloaders, ``data.sync_cache``,
+``resample`` and ``features``. Their output only reaches a score through a guarded call.
 
 The guard is honour-system code, not a security boundary: its job is to make an
 accidental peek impossible and a deliberate one visible in the audit log.
@@ -49,16 +56,15 @@ class open_holdout:  # noqa: N801 - used as a context manager, reads like a func
     ...     ...
     """
 
-    def __init__(self, reason: str, audit_log: Path | None = None) -> None:
+    def __init__(self, reason: str) -> None:
         if not isinstance(reason, str) or len(reason.strip()) < MIN_REASON_CHARS:
             raise ValueError(f"open_holdout needs a reason of at least {MIN_REASON_CHARS} characters")
         self.reason = reason.strip()
         self.caller = _caller(2)
-        self.audit_log = audit_log
         self._token: contextvars.Token | None = None
 
     def __enter__(self) -> open_holdout:
-        path = Path(self.audit_log or config.HOLDOUT_AUDIT_LOG)
+        path = Path(config.HOLDOUT_AUDIT_LOG)
         record = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "reason": self.reason,

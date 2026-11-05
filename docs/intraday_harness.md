@@ -31,11 +31,11 @@ agents; `load_klines` only reads the cache, so agents never race on the download
 | `resample` | `resample(df, "15m"/"1h"/"4h", incomplete=...)` | `label='left', closed='left'`, epoch-anchored. A bar missing any 5m sub-bar raises `IncompleteBarError` unless you pass `incomplete="drop"` or `"flag"` |
 | `features` | `make_feature_frame(primary, other, params=...)`, or each function | causal (value at `t` uses bars `<= t`), pure. Windows are in bars of the frame's timeframe |
 | `labels` | `forward_return(df, h)`, `triple_barrier(df, h, pt, sl, vol_window)` | start at `open[t+1]`; return `t1` = when the label is known (for purging) |
-| `splits` | `walk_forward_splits(index, t1, ...)`, `purged_kfold`, `purged_tail_split` | monthly test blocks over 2020-01..2026-06, purge by `t1`, embargo after test |
-| `backtest` | `run_backtest(df, target, cost_bps_per_side)`, `buy_and_hold`, `vol_matched_buy_and_hold` | `target[t]` decided at `t` close, filled at `t+1` open, P&L open-to-open |
+| `splits` | `walk_forward_splits(index, t1, ...)`, `purged_kfold`, `purged_tail_split` | monthly test blocks over 2020-01..2026-06. `t1` is REQUIRED (`None` raises unless `allow_unpurged=True`). Rows before a block are purged by `t1`; rows after it must start at or after the block's latest `t1` plus the embargo |
+| `backtest` | `run_backtest(df, target, cost_bps_per_side)`, `buy_and_hold`, `vol_matched_buy_and_hold` | `target[t]` decided at `t` close, filled at `t+1` open, P&L open-to-open. `target` must be a float or a Series on the bars' own timestamps |
 | `metrics` | `summarize(result)` | daily-P&L Sharpe (sqrt 365), Sortino, CAGR, MaxDD, PF, t-stats, months, years |
 | `overfitting` | `dsr_from_daily`, `pbo_cscv`, `permutation_test` | per-period (daily) Sharpe throughout |
-| `trials` | `log_trial(...)`, `n_trials()`, `returns_matrix()` | append-only JSONL + parquet return series |
+| `trials` | `log_trial(...)`, `n_trials()`, `returns_matrix()` | append-only JSONL + one parquet per call; counts RUNS (config x seed x code x data); OOS window only |
 | `promotion` | `evaluate(Candidate)`, `verdict(table)`, `holdout_check(...)` | PASS only if every row passes on both symbols |
 | `holdout` | `open_holdout(reason=...)` | the only way past 2026-07-01; audited |
 
@@ -49,10 +49,18 @@ P&L of target[t] = open_{t+2} / open_{t+1} - 1   (minus cost on |Δposition|)
 ```
 
 * Targets must be in `[0, 1]` (long/flat; `ValueError` otherwise). `NaN` means flat.
-* Cost is `cost_bps_per_side / 1e4 * |Δposition| * equity` at each fill. Base 5, stress 10.
+* A fill happens only when the target changes. Cost is `cost_bps_per_side / 1e4 * |target - drifted weight| * equity`
+  at each fill (for 0/1 targets that is `|Δposition|`). Base 5, stress 10.
 * The last bar has no next open, so the book is forced flat there (exit cost charged).
 * `max_round_trips_per_day` and `min_hold_bars` are applied to executed positions.
-* Fractional positions are constant-weight between fills (drift is not charged).
+* Between fills the book holds shares, so a fractional weight drifts with the price
+  (`result.bars["weight"]`). A constant 0.5 target is a true 50% hold, not a free
+  5-minute rebalance. Vol-targeting strategies that change the target every bar pay for
+  every rebalance; round your targets if you do not want that.
+* Target timestamps must be bar open times: a tz-naive, shifted or integer-indexed target
+  raises rather than silently becoming a flat book.
+* Data gaps are flagged, not hidden: `result.bars["span_bars"]` (> 1 across a hole), trade
+  columns `crosses_gap` and `holding_time`, and `result.params["bars_held_across_gap"]`.
 * Days are UTC calendar days; every day in the span is in `result.daily` (0 when flat).
 
 ## End-to-end example
@@ -101,13 +109,23 @@ print(table.to_string(index=False), promotion.verdict(table))
 ## Rules for experiment agents
 
 1. **Never touch the holdout.** Data at or after `2026-07-01 00:00 UTC` raises
-   `HoldoutViolation` in the loader, splitter, simulator, metrics, trial log and promotion.
+   `HoldoutViolation` in `load_klines`, both label functions, all three splitters,
+   `run_backtest`, every public `metrics` helper, `dsr_from_daily` / `pbo_cscv` (DataFrame) /
+   `permutation_test`, `log_trial` and `promotion`. A result built inside `open_holdout`
+   still raises when analysed after the block closes. Raw plumbing (`binance.*`,
+   `sync_cache`, `resample`, `features`) is not guarded; its output reaches a score only
+   through a guarded call.
    `open_holdout(reason=...)` exists for ONE final check of a candidate that already PASSed
    promotion, run by the human or orchestrator, never by an experiment agent. Every open is
-   appended to `research/intraday/holdout_access.jsonl` with the reason and caller.
-2. **Log every configuration you evaluate**, winners and losers, at base cost and at stress
-   cost: `trials.log_trial(...)`. The DSR deflates by the distinct-config count across ALL
-   families; an unlogged config makes every other result look better than it is.
+   appended to `research/intraday/holdout_access.jsonl` with the reason and caller. The path
+   is not a parameter (tests monkeypatch `config.HOLDOUT_AUDIT_LOG`).
+2. **Log every run you evaluate**, winners and losers, at base cost and at stress cost:
+   `trials.log_trial(...)`. The DSR deflates by the distinct-RUN count across ALL families,
+   where a run is (family, params, timeframe, symbol, seed, git sha, data hash): a new seed,
+   a code change or new data is a new trial, and each run keeps its own return series for
+   PBO. Commit experiment code: the git sha covers tracked files (an uncommitted diff is
+   hashed in), not untracked scripts. Log only the OOS series over `[EVAL_START, EVAL_END)`;
+   anything earlier raises. An unlogged run makes every other result look better than it is.
 3. **One family per agent** (e.g. `rule_baselines`, `logreg`, `lgbm`, `meta_label`,
    `voltarget_trend`). Each family is its own JSONL file, so parallel agents never append
    to the same file. Rule baselines log with `kind="baseline"`; promotion requires beating
@@ -129,7 +147,7 @@ Walk-forward OOS 2020-01-01..2026-06-30, each of BTCUSDT and ETHUSDT separately:
 |---|---|
 | net Sharpe @ 5 bps/side | >= 1.0 |
 | net Sharpe @ 10 bps/side | > 0 |
-| DSR (N = distinct configs in the whole registry, variance of trial daily Sharpes) | >= 0.95 |
+| DSR (N = distinct runs in the whole registry, variance of run daily Sharpes) | >= 0.95 |
 | PBO, CSCV with 16 blocks over the registry's base-cost return matrix for the symbol | <= 0.20 |
 | OOS trades | >= 500 |
 | t-stat of mean net bps/trade, or of daily P&L | >= 3 |
@@ -140,7 +158,9 @@ Walk-forward OOS 2020-01-01..2026-06-30, each of BTCUSDT and ETHUSDT separately:
 | best month share of total (log) P&L | < 30% |
 | Sharpe beats buy-and-hold, vol-matched buy-and-hold, best `kind="baseline"` trial | > |
 | random-timing permutation p (same trades and gaps, shuffled order) | < 0.05 |
-| covers the full range, costs are 5 and 10, config is logged | yes |
+| backtest starts in [2020-01-01, +7 days] and ends within 7 days of 2026-06-30 | yes |
+| stress run holds the base positions on the same bars; `bars` equals the base bars | yes |
+| costs are 5 and 10, config is logged | yes |
 
 Holdout (`promotion.holdout_check`, only inside `open_holdout`): net P&L > 0 and Sharpe
 >= 0.5 at 5 bps/side, both symbols, holdout-only data.
@@ -158,7 +178,8 @@ Holdout (`promotion.holdout_check`, only inside `open_holdout`): net P&L > 0 and
 ## Known limitations
 
 * Fills are at the bar open with a flat cost; no spread model, slippage curve or queue.
-* Fractional positions ignore intra-holding weight drift.
+* Rebalances are full: any change of target re-sets the weight to the target and pays for
+  the whole distance from the drifted weight (no partial or banded rebalancing).
 * The permutation test measures timing skill only; a high-turnover strategy can pass it and
   still lose money after costs (other criteria catch that).
 * PBO needs at least 2 logged trials for the symbol and uses only the dates all trials share.
