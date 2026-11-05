@@ -14,7 +14,7 @@ from profit_engine.live.runner import tick
 from profit_engine.live.store import Store
 
 
-def get(app, path: str, query: str = "") -> tuple[int, bytes]:
+def get(app, path: str, query: str = "", host: bytes = b"127.0.0.1:8765") -> tuple[int, bytes]:
     """Minimal ASGI GET (httpx is not a dependency of this repo)."""
     sent: list[dict] = []
     state = {"requested": False}
@@ -39,7 +39,7 @@ def get(app, path: str, query: str = "") -> tuple[int, bytes]:
     scope = {
         "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "GET", "scheme": "http",
         "path": path, "raw_path": path.encode(), "query_string": query.encode(), "root_path": "",
-        "headers": [(b"host", b"127.0.0.1:8765")], "client": ("127.0.0.1", 50000), "server": ("127.0.0.1", 8765),
+        "headers": [(b"host", host)], "client": ("127.0.0.1", 50000), "server": ("127.0.0.1", 8765),
     }  # fmt: skip
     asyncio.run(run())
     status = next(m["status"] for m in sent if m["type"] == "http.response.start")

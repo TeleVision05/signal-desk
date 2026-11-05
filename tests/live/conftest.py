@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from profit_engine.live import macos
 from profit_engine.live.notify import Notifier
 from profit_engine.live.store import Store
 
@@ -28,3 +29,10 @@ def _isolated_env(tmp_path, monkeypatch):
     monkeypatch.delenv("SIGNAL_DESK_LIVE_DB", raising=False)
     monkeypatch.delenv("SIGNAL_DESK_BOOKS", raising=False)
     monkeypatch.setenv("SIGNAL_DESK_NOTIFY", "0")
+
+
+@pytest.fixture(autouse=True)
+def _no_launchctl(monkeypatch):
+    """install's running check never calls the real launchctl or sleeps in a test."""
+    monkeypatch.setattr(macos, "_launchctl_probe", lambda _cmd: (0, "\tstate = running\n"))
+    monkeypatch.setattr(macos, "_sleep", lambda _s: None)

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 import os
 import re
 from dataclasses import dataclass, fields
@@ -79,9 +80,46 @@ class LiveConfig:
     source: Path
 
 
+# Allowed range per numeric setting (inclusive). A wrongly typed or out-of-range value is a
+# ConfigError, so a broken edit keeps the last good settings instead of reaching the loop.
+LIMITS: dict[str, tuple[float, float]] = {
+    "cost_bps_per_side": (0.0, 1000.0),
+    "poll_seconds": (5.0, 3600.0),
+    "jitter": (0.0, 0.5),
+    "max_daily_loss": (0.0, 0.99),  # 0 turns the limit off
+    "stale_after_bars": (1.0, 1000.0),
+    "max_price_jump": (0.01, 10.0),
+    "settle_seconds": (0.0, 120.0),  # under 5 minutes: the bar source re-fetches the last 2 bars
+    "starting_equity": (1.0, 1e12),
+    "notify_min_interval_s": (0.0, 86400.0),
+}
+
+
+BOOK_OVERRIDES = ("starting_equity", "cost_bps_per_side", "max_daily_loss")  # per-book values for settings
+
+
+def _number(name: str, value: object, where: str = "") -> float:
+    lo, hi = LIMITS[name]
+    ok = isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+    if not ok or not lo <= value <= hi:
+        raise ConfigError(f"{where}{name} must be a number from {lo:g} to {hi:g}, got {value!r}")
+    return float(value)
+
+
+def _flag(name: str, value: object, where: str = "") -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"{where}{name} must be true or false (no quotes), got {value!r}")
+    return value
+
+
 def _settings(raw: dict) -> Settings:
-    known = {f.name for f in fields(Settings)}
-    values = {k: raw[k] for k in known if k in raw}
+    if not isinstance(raw, dict):
+        raise ConfigError("the books settings file must hold a JSON object")
+    values = {}
+    for f in fields(Settings):
+        if f.name in raw:
+            check = _flag if f.type in (bool, "bool") else _number
+            values[f.name] = check(f.name, raw[f.name])
     settings = Settings(**values)
     if os.environ.get("SIGNAL_DESK_NOTIFY", "").strip() == "0":
         settings = Settings(**{**settings.__dict__, "notifications": False})
@@ -137,14 +175,13 @@ def _book(entry: dict, settings: Settings, models_dir: Path, seen: set[str]) -> 
             raise ConfigError(f"book {book_id!r}: {key} {entry[key]!r} differs from the strategy's")
     _check_book(book_id, strategy, seen)
     seen.add(book_id)
+    where = f"book {book_id!r}: "
     return BookSpec(
         book_id=book_id,
         title=str(entry.get("title") or book_id),
         strategy=strategy,
-        enabled=bool(entry.get("enabled", True)),
-        starting_equity=float(entry.get("starting_equity", settings.starting_equity)),
-        cost_bps_per_side=float(entry.get("cost_bps_per_side", settings.cost_bps_per_side)),
-        max_daily_loss=float(entry.get("max_daily_loss", settings.max_daily_loss)),
+        enabled=_flag("enabled", entry.get("enabled", True), where),
+        **{k: _number(k, entry.get(k, getattr(settings, k)), where) for k in BOOK_OVERRIDES},
     )
 
 
@@ -152,7 +189,10 @@ def parse_config(raw: dict, models_dir: Path | None = None, source: Path | None 
     settings = _settings(raw)
     seen: set[str] = set()
     models = Path(models_dir or paths.models_dir())
-    books = tuple(_book(e, settings, models, seen) for e in raw.get("books") or [])
+    entries = raw.get("books") or []
+    if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
+        raise ConfigError("'books' must be a list of book entries")
+    books = tuple(_book(e, settings, models, seen) for e in entries)
     return LiveConfig(settings=settings, books=books, source=Path(source or "<memory>"))
 
 

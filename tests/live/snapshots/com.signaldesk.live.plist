@@ -9,6 +9,8 @@
 		<key>PYTHONUNBUFFERED</key>
 		<string>1</string>
 	</dict>
+	<key>ExitTimeOut</key>
+	<integer>30</integer>
 	<key>KeepAlive</key>
 	<true/>
 	<key>Label</key>

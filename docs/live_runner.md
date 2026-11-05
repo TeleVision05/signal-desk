@@ -35,15 +35,17 @@ Every 30 s (with +/-10 % jitter), for each enabled book:
 | 1. clock | Ask Binance for its time. All "is this bar closed?" questions use the **exchange** clock, so a Mac clock that is off cannot make an unfinished bar look closed (a skew over 60 s is logged). |
 | 2. new bar? | If no bar of the book's timeframe can have closed since the last one processed, skip to step 6 (a small request for the last 30 minutes of 5m bars). |
 | 3. bars | Fetch recent 5m klines from `data-api.binance.vision` (`intraday.binance.fetch_rest`). A 5m bar counts as closed once `open + 5m + settle (2 s) <= exchange time`; the in-progress bar is dropped from everything except its **open**. Resample with the harness `resample(..., incomplete="drop")`. If a data gap leaves fewer than `warmup_bars` complete bars, the lookback is doubled (up to 3 times) so a warmed-up book keeps deciding on the same window the harness uses; if it still falls short, a `warming_up` event says so. |
-| 4. guards | No trade, and an event instead, when: the newest complete bar ended more than 2 timeframes ago (`stale_data`); the newest bar is missing 5m data (`gap`; the book waits for the next complete bar rather than trade an older one at a past price); the fill price is off by more than 25 % from the decision close (`bad_price`); the next bar has not started yet (retry next tick); the next bar's first 5m bar has zero volume, i.e. an exchange halt with a stale open (`halted`; like the harness, the book acts on the next bar with trading instead). |
-| 5. decide + fill | The strategy sees the last `warmup_bars` closed bars and returns a target in [0, 1]. The target fills at the **next bar's open** (the open of the bar now in progress, fixed once it starts) with `cost_bps_per_side` (5) on the traded fraction. Claim, fill, position and events are **one SQLite transaction**. |
+| 4. guards | No trade, and an event instead, when: the newest complete bar ended more than 2 timeframes ago (`stale_data`, checked even when that bar was already traded, so a feed that stops publishing is never reported as up to date; the heartbeat turns "degraded"); the fill price is off by more than 25 % from the decision close (`bad_price`); the fill bar has not started yet (retry next tick); no 5m bar of the fill bar has traded yet (`halted` once a closed 5m bar shows zero volume, i.e. an exchange halt; a bar in progress with no trades yet just waits, without an event). |
+| 5. decide + fill | The strategy sees the last `warmup_bars` closed bars and returns a target in [0, 1]. The target fills at the open of the **bar now in progress**, which is the next bar that exists, exactly as the harness fills: normally the bar right after the decision bar; after a bar dropped for missing 5m data (`gap`), the one after that. During a halt the fill waits until a 5m bar of the fill bar trades and then uses the fill bar's open (the harness price); a fill bar with no trading at all is skipped and the next decision supersedes it. Cost `cost_bps_per_side` (5) on the traded fraction. Claim, fill, position and events are **one SQLite transaction**; a daily-loss pause is read inside that transaction, so a pause set by another process a moment earlier is always applied. |
 | 6. mark | Equity is marked at the latest closed 5m close (once per 5m bar). |
 | 7. loss limit | If equity is down `max_daily_loss` (5 %) from the equity at 00:00 UTC (the position held at midnight, valued at the 23:55 bar's close): sell to cash at the next 5m open, pause until next UTC midnight, event + notification. If the next 5m bar is not served yet, later ticks in the same 5m bar re-check. While paused, decisions are still recorded (as "stay in cash"). |
 
 This is the harness timing contract (`docs/intraday_harness.md`): decide at bar *t* close,
 fill at bar *t+1* open, cost on |Δposition|, never the in-progress bar.
 `tests/live/test_live_parity.py` replays a bar stream through the runner and checks that
-fill times, prices, targets and costs equal `run_backtest` exactly, and equity to 1e-9.
+fill times, prices, targets and costs equal `run_backtest` exactly, and equity to 1e-9;
+`tests/live/test_live_guards.py` does the same with a halt or a missing 5m bar at the start of
+a fill bar.
 
 ### Trading each bar at most once
 
@@ -66,7 +68,9 @@ the dashboard read while the runner writes; `busy_timeout` is 30 s.
 **A sleeping Mac runs nothing.** launchd does not run agents during sleep, and Binance bars
 that close meanwhile are not traded. On wake, the next tick acts on the **newest closed bar
 only**, fills it at the next bar's open, and records a `catch_up` event with how many decision
-bars were skipped. Missed bars are never replayed (replaying would trade at prices you could
+bars were not acted on. That count also includes bars skipped for a halt, a bad price or a
+strategy error (the event says so; the earlier events say which). Bars dropped for missing
+5m data are not counted: they never existed as decision bars. Missed bars are never replayed (replaying would trade at prices you could
 no longer get). The loss-limit baseline is the equity at 00:00 UTC even when the Mac slept
 through midnight: on the first mark of a new day the runner fetches the 23:55 bar and values
 the position held at midnight at its close (the last mark before midnight stands in if that
@@ -97,7 +101,11 @@ off. At most one per book per 5 minutes; anything held back is summarised in the
 `install` writes two per-user agents and loads them with `launchctl bootstrap gui/$UID`:
 
 * `com.signaldesk.live`: `python -m profit_engine.live.cli run --no-console-log`
-* `com.signaldesk.dashboard`: `python -m profit_engine.live.cli dashboard` (127.0.0.1:8765)
+* `com.signaldesk.dashboard`: `python -m profit_engine.live.cli dashboard` (127.0.0.1:8765).
+  It answers only requests addressed to `127.0.0.1`, `localhost` or `[::1]` (any other `Host`
+  header gets a 400), so a web page cannot read it through DNS rebinding. The status line
+  calls the runner late only after its own planned next check (`next_check_s` on the
+  heartbeat; up to 10 minutes while Binance is unreachable) plus 2 minutes.
 
 Both have `RunAtLoad` (start at login), `KeepAlive` (restart if they exit),
 `ThrottleInterval` 30 s, `WorkingDirectory` = the repo, and logs in
@@ -105,14 +113,24 @@ Both have `RunAtLoad` (start at login), `KeepAlive` (restart if they exit),
 your database and logs are kept. Nothing is loaded unless you run `install` yourself.
 `install --no-dashboard` also stops and removes a dashboard agent left by an earlier full
 install. `SIGNAL_DESK_*` path variables set at install time are written into the agents as
-absolute paths, so the agents and your terminal open the same files.
+absolute paths (the launchd log files too), so the agents and your terminal open the same
+files. `ExitTimeOut` is 30 s: on SIGTERM the runner stops retrying Binance at once, so only a
+request already in flight (10 s timeout) delays the clean exit.
+
+`install` waits 5 s after loading and checks each agent with `launchctl print`. It says
+"Installed and started ... it is running" only if the agent is running then; otherwise it
+says the agent is not staying up and exits 1. launchctl's own messages go to
+`~/Library/Logs/SignalDesk/install.jsonl`, not to the terminal.
 
 A second runner (say a manual `signal-desk-live run` while the agent is loaded) waits for
 the lock instead of exiting, and the dashboard waits for port 8765 to be free: neither turns
 `KeepAlive` into a relaunch every 30 s.
 
+### If the agents do not start
+
 UNVERIFIED (not yet tried on a real login): the agents run this venv's python from inside
 `~/Documents`, which macOS privacy protection (TCC) can block for launchd-started programs.
+`install` now reports this case ("not staying up") instead of claiming success.
 If `runner.err.log` shows `Operation not permitted` or missing packages, either give the
 python binary the venv points to (`readlink -f .venv/bin/python`) Full Disk Access in System
 Settings > Privacy & Security, or clone the repo outside `~/Documents`, `~/Desktop` and
@@ -135,8 +153,11 @@ Settings > Privacy & Security, or clone the repo outside `~/Documents`, `~/Deskt
 All settings: `cost_bps_per_side`, `poll_seconds`, `jitter`, `max_daily_loss` (0 turns it
 off), `stale_after_bars`, `max_price_jump`, `settle_seconds`, `starting_equity`,
 `notifications`, `notify_min_interval_s`. Per book: `title`, `enabled`, `starting_equity`,
-`cost_bps_per_side`, `max_daily_loss`. The file is re-read every loop; a broken edit keeps
-the last good settings and logs a `config_error` event. A new `book_id` starts a new book
+`cost_bps_per_side`, `max_daily_loss`. Numbers must be JSON numbers within range (for example
+`poll_seconds` 5 to 3600, `settle_seconds` 0 to 120, `max_daily_loss` 0 to 0.99) and
+`notifications` / `enabled` must be `true` or `false` without quotes (`registry.LIMITS`). The
+file is re-read every loop; a broken edit, including a wrongly typed value, keeps the last
+good settings and logs a `config_error` event. A new `book_id` starts a new book
 with fresh paper cash; renaming one starts over (the old book stays in the database).
 Changing an existing book's `symbol` or `timeframe` is refused: that book is skipped with a
 `config_conflict` event (its coins would otherwise be priced in the other market). Use a new
@@ -185,12 +206,15 @@ backtest of the live code path.
 * A fill is booked at the next bar's open even when the runner gets to it late (up to one
   bar later, e.g. just after wake). The decision only uses data up to the decision bar's
   close, but the fill price is from up to one timeframe earlier than the moment of booking.
-* Halts: the harness judges a halt on the whole decision bar (its total volume is zero); the
-  runner cannot see the rest of a bar in progress, so it judges on the bar's first 5m bar.
-  They agree when the whole bar is halted (tested); a halt covering only the first 5m bar
-  makes the runner skip a fill the harness takes at that bar's stale open.
-* On data with gaps, the harness fills a decision at the next bar that exists, while the
-  runner (which cannot see the future) uses the next bar's open as soon as it starts. Parity
-  is exact on gapless data.
+* Halts: like the harness, a fill is skipped only when the whole fill bar has no volume. While
+  the fill bar's 5m bars show no trading, the runner waits; once one trades it books the fill
+  at the fill bar's open (the harness price), so that fill is booked up to a few minutes late
+  at the earlier, possibly stale, price. Tested against `run_backtest` for a halt of the first
+  5m bar and of the whole bar.
+* Gaps: the harness drops a bar with any missing 5m data and fills at the next bar that
+  exists; the runner does the same when the missing 5m bar is the first one of the fill bar
+  (tested), or any earlier one. A 5m bar missing LATER in a fill bar is invisible when the
+  runner fills at that bar's open, so there the harness (which skips the whole bar) and the
+  runner differ. Parity is exact on gapless data.
 * The daily loss limit is checked on 5m closes while the Mac is awake; a loss that happens
   during sleep is seen (and acted on) only after wake.

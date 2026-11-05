@@ -104,9 +104,13 @@ def test_missing_5m_bar_drops_the_decision_bar_and_logs_a_gap(store, quiet, bars
     holed = bars5.drop(pd.Timestamp("2021-03-01 04:30+00:00"))
     strategy = Const(1.0)
     result = tick(config(book(strategy)), store, FakeSource({"BTCUSDT": holed}, "2021-03-01 05:00:40+00:00"), quiet)
-    assert result["books"][0]["decision"] == "bar_incomplete"
-    assert strategy.windows == []  # never decides on the older 03:00 bar late, at a past price
-    assert rows(store, "SELECT * FROM decisions") == []
+    assert result["books"][0]["decision"] == "traded"
+    # Like the harness (whose 1h index skips the incomplete 04:00 bar): decide on 03:00 and fill
+    # at the next bar that exists, 05:00, which is the bar now in progress (never a past price).
+    assert strategy.windows[0].index[-1] == pd.Timestamp("2021-03-01 03:00+00:00")
+    (fill,) = rows(store, "SELECT * FROM fills")
+    assert (fill["decision_bar_ts"], fill["fill_bar_ts"]) == ("2021-03-01T03:00:00Z", "2021-03-01T05:00:00Z")
+    assert fill["price"] == holed.at[pd.Timestamp("2021-03-01 05:00+00:00"), "open"]
     assert len(rows(store, "SELECT * FROM events WHERE kind='gap'")) == 1
 
 

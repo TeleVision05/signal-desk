@@ -6,16 +6,20 @@ Per enabled book:
    EXCHANGE's clock), skip straight to marking. Otherwise fetch recent 5m bars, drop the
    in-progress ones (:func:`market.split_closed`), resample with the harness ``resample``
    (``incomplete="drop"``) and take the latest CLOSED decision bar.
-2. Guards: stale feed (latest closed bar more than ``stale_after_bars`` timeframes old) and
-   price sanity skip with an event; the fill price must exist (the next bar's open).
-   The history fetched is widened (up to :data:`MAX_WIDEN` doublings) until it holds
-   ``warmup_bars`` complete bars, so a Binance data gap never stops a warmed-up book from
-   deciding; if it still cannot, a ``warming_up`` event says so. A fill that would land on a
-   halted 5m bar (``volume == 0``: Binance prints a stale open) is not taken; like the
-   harness, the book waits for the next bar with trading (``halted`` event).
-3. Decide on the latest closed bar ONLY. Bars missed while the Mac slept are counted in a
-   ``catch_up`` event, never replayed. Fill at the NEXT bar's open (its open is fixed once
-   that bar starts), cost ``cost_bps_per_side`` on the traded fraction. All of it is one
+2. Guards: stale feed (latest closed bar more than ``stale_after_bars`` timeframes old, checked
+   even when that bar was already processed, so a frozen feed is never silent) and price
+   sanity skip with an event; the fill price must exist. The history fetched is widened (up to
+   :data:`MAX_WIDEN` doublings) until it holds ``warmup_bars`` complete bars, so a Binance data
+   gap never stops a warmed-up book from deciding; if it still cannot, a ``warming_up`` event
+   says so.
+3. Decide on the latest closed bar ONLY and fill at the open of the bar now in progress, as
+   the harness fills at the next bar that exists: right after the decision bar normally, or
+   after bars dropped for missing 5m data. A halt is judged like the harness, on the whole fill
+   bar: while none of its 5m bars seen so far has volume, the book waits (``halted`` event once
+   a closed 5m bar shows it); as soon as one trades, it fills at the fill bar's open, which is
+   the harness price. A fill bar that ends with no trading is skipped and the next decision
+   supersedes it. Decision bars not acted on are counted in a ``catch_up`` event, never
+   replayed. Cost ``cost_bps_per_side`` on the traded fraction. All of it is one
    :meth:`Store.commit_bar` transaction, so the bar is traded at most once.
 4. Mark equity at the latest closed 5m close. If equity is down ``max_daily_loss`` from the
    equity at 00:00 UTC (the 23:55 bar's close, even if the Mac slept through midnight), go
@@ -48,6 +52,7 @@ MARK_LOOKBACK = pd.Timedelta("30min")
 MARK_JUMP_WINDOW = pd.Timedelta("1h")
 SKEW_WARN_S = 60.0
 MAX_WIDEN = 3  # history is doubled at most this many times to find warmup_bars complete bars
+UNHEALTHY = {"stale_data"}  # statuses that make the runner heartbeat "degraded" (the feed is not live)
 
 
 @dataclass
@@ -161,23 +166,25 @@ def _run_strategy(ctx: TickContext, spec: BookSpec, window: pd.DataFrame) -> Dec
     return normalize_decision(spec.strategy.decide(window, other))
 
 
-def _paused_decision(paused_until: pd.Timestamp, raw: Decision) -> Decision:
-    text = (
-        "The book is paused after hitting its daily loss limit, so it stays in cash until "
-        f"{paused_until:%Y-%m-%d %H:%M} UTC."
-    )
-    return Decision(0.0, text, {"strategy_target": raw.target, "strategy_explanation": raw.explanation})
-
-
-def _catch_up(spec: BookSpec, last: pd.Timestamp | None, latest: pd.Timestamp) -> tuple[int, tuple[EventSpec, ...]]:
-    skipped = 0 if last is None else max(round((latest - last) / spec.tf) - 1, 0)
+def _catch_up(spec: BookSpec, skipped: int, latest: pd.Timestamp) -> tuple[EventSpec, ...]:
     if not skipped:
-        return 0, ()
+        return ()
     text = (
-        f"{skipped} {spec.timeframe} decision bar(s) passed without a check (the Mac was asleep or offline). "
-        "The book acted on the latest closed bar only; missed bars are not replayed."
+        f"{skipped} {spec.timeframe} decision bar(s) since the last decision were not acted on: the Mac was "
+        "asleep or offline, or those bars could not be traded (see the earlier events). The book acted on the "
+        "latest closed bar only; missed bars are not replayed."
     )
-    return skipped, (EventSpec("catch_up", text, {"skipped_bars": skipped}, iso(latest)),)
+    return (EventSpec("catch_up", text, {"skipped_bars": skipped}, iso(latest)),)
+
+
+def _skipped(spec: BookSpec, frame: pd.DataFrame, bars: pd.DataFrame, last, latest: pd.Timestamp) -> int:
+    """Decision bars between ``last`` and ``latest`` that existed but were not decided. Bars that
+    were dropped for missing 5m data (a logged gap) never existed as decision bars."""
+    if last is None:
+        return 0
+    slots = pd.date_range(last + spec.tf, latest - spec.tf, freq=spec.tf)
+    dropped = int(((slots >= frame.index[0]) & ~slots.isin(bars.index)).sum())
+    return len(slots) - dropped
 
 
 def _fill_text(spec: BookSpec, fill) -> str:
@@ -196,22 +203,34 @@ class _Skip(Exception):
 @dataclass(frozen=True)
 class ReadyBar:
     latest: pd.Timestamp  # the decision bar (latest closed bar of the book's timeframe)
-    fill_ts: pd.Timestamp  # the next bar's open time: where the decision is filled
+    fill_ts: pd.Timestamp  # open time of the bar now in progress: where the decision is filled
     price: float  # that open
     close: float  # the decision bar's close
     window: pd.DataFrame  # what decide() sees
+    skipped: int  # decision bars since the last decision that were not acted on
 
 
-def _halted(ctx: TickContext, spec: BookSpec, frame: pd.DataFrame, latest: pd.Timestamp, fill_ts) -> bool:
-    if "volume" not in frame.columns or not frame.at[fill_ts, "volume"] <= 0:
-        return False
+def _halted(ctx: TickContext, spec: BookSpec, frame: pd.DataFrame, latest: pd.Timestamp, fill_ts) -> str | None:
+    """None if the fill bar has traded (any 5m bar of it with volume), else why the book waits.
+
+    The harness defers a fill only when the whole fill bar has no volume, and otherwise fills
+    at its open, so the runner waits while no 5m bar of the fill bar has traded yet."""
+    if "volume" not in frame.columns:
+        return None
+    seen = frame[(frame.index >= fill_ts) & (frame.index < fill_ts + spec.tf)]
+    if (seen["volume"] > 0).any():
+        return None
+    closed, _ = split_closed(seen, ctx.now, ctx.settle)
+    if closed.empty:
+        return "waiting_for_trades"  # only the bar in progress, seconds old: no trades yet is normal
     ctx.event(
         spec.book_id, "halted",
-        f"Binance shows no {coin(spec.symbol)} trading at {fill_ts:%Y-%m-%d %H:%M} UTC (an exchange halt), so the "
-        "book did not fill at that stale price. It keeps its position and acts on the next bar with trading.",
+        f"Binance shows no {coin(spec.symbol)} trading since {fill_ts:%Y-%m-%d %H:%M} UTC (an exchange halt), so "
+        f"the book has not filled yet. It fills at that {spec.timeframe} bar's open once trading resumes within "
+        "it, like the backtest; otherwise it keeps its position and acts on the next bar.",
         key=iso(fill_ts), decision_bar=iso(latest), fill_bar=iso(fill_ts),
     )  # fmt: skip
-    return True
+    return "halted"
 
 
 def _warming_up(ctx: TickContext, spec: BookSpec, bars: pd.DataFrame) -> None:
@@ -230,19 +249,18 @@ def ready_bar(ctx: TickContext, spec: BookSpec, last: pd.Timestamp | None) -> Re
     if bars.empty:
         raise _Skip("waiting_for_data")
     latest = bars.index[-1]
+    if _is_stale(ctx, spec, latest):  # before "up to date": a frozen feed must not look healthy
+        raise _Skip("stale_data")
     if last is not None and latest <= last:
         raise _Skip("up_to_date")
-    if _is_stale(ctx, spec, latest):
-        raise _Skip("stale_data")
-    if latest < latest_due_bar(ctx.now, spec.tf, ctx.settle):
-        # The newest bar is missing 5m data (logged as a gap). Deciding on an older bar now
-        # would fill at a price from the past, so wait for the next complete bar instead.
-        raise _Skip("bar_incomplete")
-    fill_ts = latest + spec.tf
+    # The bar in progress. Bars between it and ``latest`` were dropped for missing 5m data (a
+    # logged gap); like the harness, the decision fills at the next bar that exists.
+    fill_ts = latest_due_bar(ctx.now, spec.tf, ctx.settle) + spec.tf
     if fill_ts not in frame.index:
         raise _Skip("waiting_for_next_bar")
-    if _halted(ctx, spec, frame, latest, fill_ts):
-        raise _Skip("halted")
+    halted = _halted(ctx, spec, frame, latest, fill_ts)
+    if halted:
+        raise _Skip(halted)
     price, close = float(frame.at[fill_ts, "open"]), float(bars.at[latest, "close"])
     if not _price_ok(ctx, spec, price, close, "fill"):
         raise _Skip("bad_price")
@@ -250,25 +268,24 @@ def ready_bar(ctx: TickContext, spec: BookSpec, last: pd.Timestamp | None) -> Re
     if window is None:
         _warming_up(ctx, spec, bars)
         raise _Skip("warming_up")
-    return ReadyBar(latest, fill_ts, price, close, window)
+    return ReadyBar(latest, fill_ts, price, close, window, _skipped(spec, frame, bars, last, latest))
 
 
 def decide_book(ctx: TickContext, spec: BookSpec, book: dict) -> str:
-    """Process the latest closed decision bar, if it is new. Returns a short status word."""
+    """Process the latest closed decision bar, if it is new. Returns a short status word.
+
+    A daily-loss pause is applied inside :meth:`Store.commit_bar`, on the book row read in the
+    same transaction, so a pause set by another process a moment ago is never missed."""
     last = parse_ts(book["last_bar_ts"])
     try:
         bar = ready_bar(ctx, spec, last)
     except _Skip as skip:
         return skip.status
     decision = _run_strategy(ctx, spec, bar.window)
-    paused = parse_ts(book["paused_until"])
-    if paused is not None and ctx.now < paused:
-        decision = _paused_decision(paused, decision)
-    skipped, events = _catch_up(spec, last, bar.latest)
     commit = ctx.store.commit_bar(
         spec.book_id,
         BarCommit(bar.latest, bar.fill_ts, decision, bar.price, bar.close, spec.cost_bps_per_side, ctx.now,
-                  spec.strategy.meta.version, skipped, events),
+                  spec.strategy.meta.version, bar.skipped, _catch_up(spec, bar.skipped, bar.latest)),
     )  # fmt: skip
     if not commit.claimed:
         return "already_done"
@@ -373,7 +390,8 @@ def safe_process(ctx: TickContext, spec: BookSpec) -> dict:
     """process_book, with every failure turned into a plain-language event (never a crash)."""
     base = {"book_id": spec.book_id, "ok": False}
     try:
-        return {**process_book(ctx, spec), "ok": True}
+        result = process_book(ctx, spec)
+        return {**result, "ok": result["decision"] not in UNHEALTHY}
     except DataUnavailable as exc:
         log.warning("market data unavailable", extra={"book_id": spec.book_id, "error": str(exc)})
         msg = f"Couldn't get {coin(spec.symbol)} prices from Binance. Nothing was traded; it will retry shortly."

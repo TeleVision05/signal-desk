@@ -11,6 +11,7 @@ in-memory cache so a 30-second loop re-downloads only the newest bars.
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Protocol
 
@@ -24,6 +25,9 @@ from profit_engine.intraday.data import normalize_raw
 FIVE_MIN = pd.Timedelta("5min")
 SERVER_TIME_URL = "https://data-api.binance.vision/api/v3/time"
 CACHE_SPAN = pd.Timedelta(days=21)
+# Each refresh re-fetches this many bars before the newest cached one: a bar that had just
+# closed at the previous fetch (inside the settle margin) may since have been finalized.
+REFETCH_BARS = 2
 # What normalize_raw is told "now" is. It drops bars with close_time >= now; the runner wants
 # every bar kept (the in-progress bar's OPEN is the fill price) and decides what is closed itself,
 # on Binance's clock. A fixed far-future time, never the Mac's clock, which may be days off.
@@ -51,20 +55,33 @@ def split_closed(frame: pd.DataFrame, now: pd.Timestamp, settle: pd.Timedelta) -
 
 
 class BinanceBarSource:
-    def __init__(self, session: requests.Session | None = None, retries: int = 2, timeout: float = 10.0) -> None:
+    def __init__(
+        self, session: requests.Session | None = None, retries: int = 2, timeout: float = 10.0,
+        stop: threading.Event | None = None,
+    ) -> None:  # fmt: skip
+        """``stop`` (the runner's shutdown event) ends retries at once, so a stalled network
+        cannot hold a SIGTERM past launchd's exit timeout."""
         self.session = session or requests.Session()
-        self.retries, self.timeout = retries, timeout
+        self.retries, self.timeout, self.stop = retries, timeout, stop
         self._cache: dict[str, pd.DataFrame] = {}
+
+    def _stopping(self) -> bool:
+        return self.stop is not None and self.stop.is_set()
 
     def _with_retries(self, fn):
         delay = 1.0
         for attempt in range(self.retries + 1):
+            if self._stopping():
+                raise DataUnavailable("stopping: the runner is shutting down")
             try:
                 return fn()
             except (requests.RequestException, ValueError, KeyError) as exc:
-                if attempt == self.retries:
+                if attempt == self.retries or self._stopping():
                     raise DataUnavailable(f"{type(exc).__name__}: {exc}") from exc
-                time.sleep(delay)
+                if self.stop is not None:
+                    self.stop.wait(delay)
+                else:
+                    time.sleep(delay)
                 delay *= 2
         raise AssertionError("unreachable")
 
@@ -92,8 +109,9 @@ class BinanceBarSource:
         if cached is None or cached.empty or cached.index[0] > start:
             frame = self._fetch(symbol, start)
         else:
-            # Re-fetch from the newest cached bar: it may have been in progress last time.
-            fresh = self._fetch(symbol, cached.index[-1])
+            # Re-fetch from just before the newest cached bar: it may have been in progress last
+            # time, and the bar before it may have closed only moments before that fetch.
+            fresh = self._fetch(symbol, cached.index[max(len(cached) - 1 - REFETCH_BARS, 0)])
             frame = pd.concat([cached, fresh])
             frame = frame[~frame.index.duplicated(keep="last")].sort_index()
         if not frame.empty:

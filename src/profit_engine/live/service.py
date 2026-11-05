@@ -7,9 +7,13 @@
 * every ``poll_seconds`` (default 30) with +/- ``jitter`` so the requests do not line up
   with every other client on the minute, backing off exponentially (max 10 minutes)
   while Binance is unreachable;
-* SIGTERM / SIGINT finish the current tick and exit cleanly (launchd sends SIGTERM);
-* ``books.json`` is re-read every loop, so edits apply without a restart (a broken edit
-  keeps the last good config and logs an event);
+* SIGTERM / SIGINT finish the current tick and exit cleanly (launchd sends SIGTERM): the
+  Binance source stops retrying once the stop is set, so at most one request already in
+  flight (10 s timeout) delays the exit;
+* ``books.json`` is re-read every loop, so edits apply without a restart (a broken edit,
+  including a wrongly typed setting, keeps the last good config and logs an event);
+* each loop records when it plans the next check (``next_check_s`` on the heartbeat), so
+  the dashboard can tell a runner backing off from Binance from one that stopped;
 * structured JSON logs in ``~/Library/Logs/SignalDesk/runner.jsonl`` (rotated); under launchd
   (``run --no-console-log``) nothing is copied to stderr, whose file never rotates.
 
@@ -34,9 +38,9 @@ import pandas as pd
 from profit_engine.live import paths
 from profit_engine.live.market import BarSource, BinanceBarSource
 from profit_engine.live.notify import Notifier
-from profit_engine.live.registry import ConfigError, LiveConfig, load_config
+from profit_engine.live.registry import LiveConfig, load_config
 from profit_engine.live.runner import tick
-from profit_engine.live.store import EventSpec, Store
+from profit_engine.live.store import EventSpec, Store, StoreError
 
 log = logging.getLogger("signal_desk.service")
 MAX_BACKOFF_S = 600.0
@@ -120,8 +124,8 @@ def exchange_trouble(result: dict) -> bool:
 def _reload(store: Store, previous: LiveConfig | None) -> LiveConfig | None:
     try:
         return load_config()
-    except (ConfigError, ValueError, OSError) as exc:
-        log.error("books config could not be loaded", extra={"error": str(exc)})
+    except Exception as exc:  # any broken edit (bad JSON, types, a strategy that fails to build)
+        log.error("books config could not be loaded", extra={"error": f"{type(exc).__name__}: {exc}"})
         now = pd.Timestamp.now(tz="UTC")
         msg = "The books settings file could not be read, so the runner kept the last good settings."
         store.add_event(None, EventSpec("config_error", msg, {}, now.floor("h").isoformat()), now)
@@ -140,6 +144,38 @@ def wait_for_lock(lock: InstanceLock, stop: threading.Event) -> bool:
     return False
 
 
+def open_store(stop: threading.Event) -> Store | None:
+    """The live store, waiting (not exiting) while the file is unusable: exiting would make
+    launchd's KeepAlive relaunch the runner every 30 s. None if stopped first."""
+    while True:
+        try:
+            return Store(paths.db_path())
+        except StoreError as exc:
+            log.error("live database unusable; waiting for it to be fixed", extra={"error": str(exc)})
+        if stop.wait(LOCK_RETRY_S):
+            return None
+
+
+def _loop(store: Store, source: BarSource, stop: threading.Event) -> None:
+    rng, failures, config = random.Random(), 0, None
+    while not stop.is_set():
+        config = _reload(store, config)
+        if config is not None:
+            settings = config.settings
+            notifier = Notifier(settings.notifications, settings.notify_min_interval_s)
+            try:
+                result = tick(config, store, source, notifier)
+                failures = failures + 1 if exchange_trouble(result) else 0
+                log.info("tick", extra={"result": result})
+            except Exception:  # never let one bad tick kill the loop
+                log.exception("tick failed")
+                failures += 1
+        poll, jitter = (config.settings.poll_seconds, config.settings.jitter) if config else (30.0, 0.1)
+        delay = next_delay(poll, failures, jitter, rng)
+        store.note_next_check("runner", delay)
+        stop.wait(delay)
+
+
 def run_forever(stop: threading.Event | None = None, source: BarSource | None = None) -> int:
     """Loop until SIGTERM/SIGINT (or ``stop`` is set). Returns a process exit code."""
     stop = stop or threading.Event()
@@ -149,24 +185,14 @@ def run_forever(stop: threading.Event | None = None, source: BarSource | None = 
     lock = InstanceLock(paths.lock_path())
     if not wait_for_lock(lock, stop):
         return 0
-    store, source = Store(paths.db_path()), source or BinanceBarSource()
-    rng, failures, config = random.Random(), 0, None
+    store = open_store(stop)
+    if store is None:
+        lock.release()
+        return 0
+    source = source or BinanceBarSource(stop=stop)
     log.info("runner started", extra={"db": str(store.path), "pid": os.getpid()})
     try:
-        while not stop.is_set():
-            config = _reload(store, config)
-            if config is not None:
-                settings = config.settings
-                notifier = Notifier(settings.notifications, settings.notify_min_interval_s)
-                try:
-                    result = tick(config, store, source, notifier)
-                    failures = failures + 1 if exchange_trouble(result) else 0
-                    log.info("tick", extra={"result": result})
-                except Exception:  # never let one bad tick kill the loop
-                    log.exception("tick failed")
-                    failures += 1
-            poll, jitter = (config.settings.poll_seconds, config.settings.jitter) if config else (30.0, 0.1)
-            stop.wait(next_delay(poll, failures, jitter, rng))
+        _loop(store, source, stop)
     finally:
         store.beat("runner", "stopped", pd.Timestamp.now(tz="UTC"), {"reason": "shutdown"})
         store.close()

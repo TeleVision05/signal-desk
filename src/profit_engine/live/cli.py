@@ -14,7 +14,7 @@ from profit_engine.live.notify import Notifier
 from profit_engine.live.registry import ConfigError, load_config
 from profit_engine.live.runner import tick
 from profit_engine.live.service import run_forever, setup_logging
-from profit_engine.live.store import Store
+from profit_engine.live.store import Store, StoreError
 
 PAPER = "PAPER MONEY ONLY - no real orders are ever placed."
 
@@ -86,12 +86,15 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 
 def cmd_install(args: argparse.Namespace) -> int:
 
+    if not args.dry_run:
+        setup_logging("install", to_stderr=False)  # launchctl's raw output goes here, not to the terminal
     plan = macos.default_plan(stay_awake_on_ac=args.stay_awake_on_ac, dashboard=not args.no_dashboard)
     return macos.install(plan, dry_run=args.dry_run)
 
 
 def cmd_uninstall(args: argparse.Namespace) -> int:
-
+    if not args.dry_run:
+        setup_logging("install", to_stderr=False)
     return macos.uninstall(macos.default_plan(), dry_run=args.dry_run)
 
 
@@ -124,7 +127,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return int(args.fn(args) or 0)
+    try:
+        return int(args.fn(args) or 0)
+    except StoreError as exc:  # already written for the user: no traceback
+        print(exc, file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

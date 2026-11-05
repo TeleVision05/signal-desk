@@ -75,6 +75,15 @@ def normalize_decision(raw: float | Decision) -> Decision:
     return Decision(target, text, dict(decision.details))
 
 
+def paused_decision(paused_until: pd.Timestamp, raw: Decision) -> Decision:
+    """What a book paused by its daily loss limit does instead of ``raw``: stay in cash."""
+    text = (
+        "The book is paused after hitting its daily loss limit, so it stays in cash until "
+        f"{paused_until:%Y-%m-%d %H:%M} UTC."
+    )
+    return Decision(0.0, text, {"strategy_target": raw.target, "strategy_explanation": raw.explanation})
+
+
 def decision_window(bars: pd.DataFrame, strategy: Strategy) -> pd.DataFrame | None:
     """The bars ``decide`` gets: the last ``warmup_bars`` closed bars, or None if too few."""
     n = max(int(strategy.warmup_bars), 1)

@@ -25,7 +25,7 @@ from pathlib import Path
 import pandas as pd
 
 from profit_engine.live.accounting import FillPlan, equity, plan_fill
-from profit_engine.live.strategy import Decision
+from profit_engine.live.strategy import Decision, paused_decision
 
 BUSY_TIMEOUT_MS = 30_000
 
@@ -65,6 +65,11 @@ SCHEMA_V1 = (
 )
 MIGRATIONS: dict[int, tuple[str, ...]] = {1: SCHEMA_V1}
 SCHEMA_VERSION = max(MIGRATIONS)
+TABLES = frozenset({"books", "decisions", "fills", "equity_marks", "events", "heartbeat", "notifications"})
+
+
+class StoreError(RuntimeError):
+    """The database file is not one this version can use (a newer schema, or not ours)."""
 
 
 def iso(ts: object) -> str:
@@ -153,9 +158,26 @@ class Store:
         return int(self.conn.execute("PRAGMA user_version").fetchone()[0])
 
     def migrate(self) -> int:
-        """Apply pending migrations in order; re-checks the version under the write lock."""
-        if self.user_version() >= SCHEMA_VERSION:
-            return self.user_version()
+        """Apply pending migrations in order; re-checks the version under the write lock.
+
+        Raises :class:`StoreError` for a schema newer than this code knows (a downgrade) or a
+        file that claims a version but lacks the tables: writing to either would fail later
+        with nothing on the dashboard to say why."""
+        version = self.user_version()
+        if version > SCHEMA_VERSION:
+            raise StoreError(
+                f"The live database {self.path} was written by a newer version of Signal Desk Live "
+                f"(format {version}; this copy understands up to {SCHEMA_VERSION}). Update this checkout, or set "
+                "SIGNAL_DESK_LIVE_DB to a different file."
+            )
+        if version == SCHEMA_VERSION:
+            names = {r[0] for r in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not names >= TABLES:
+                raise StoreError(
+                    f"{self.path} is not a Signal Desk Live database (it is marked with a version but lacks the "
+                    "expected tables). Set SIGNAL_DESK_LIVE_DB to a different file."
+                )
+            return version
         with self.tx() as c:
             current = int(c.execute("PRAGMA user_version").fetchone()[0])
             for version in sorted(v for v in MIGRATIONS if v > current):
@@ -207,17 +229,21 @@ class Store:
                 last = parse_ts(book["last_bar_ts"])
                 if last is not None and bc.bar_ts <= last:
                     raise _AlreadyDone
+                decision = bc.decision
+                paused = parse_ts(book["paused_until"])  # read under the write lock: never a stale pause
+                if paused is not None and bc.now < paused:
+                    decision = paused_decision(paused, decision)
                 claimed = c.execute(
                     "INSERT INTO decisions (book_id, bar_open_ts, decided_at, target, prev_target, explanation, "
                     "details_json, strategy_version, close_price, fill_bar_ts, skipped_bars) "
                     "VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(book_id, bar_open_ts) DO NOTHING",
-                    (book_id, iso(bc.bar_ts), iso(bc.now), bc.decision.target, book["target"],
-                     bc.decision.explanation, json.dumps(bc.decision.details, default=str), bc.strategy_version,
+                    (book_id, iso(bc.bar_ts), iso(bc.now), decision.target, book["target"],
+                     decision.explanation, json.dumps(decision.details, default=str), bc.strategy_version,
                      bc.close_price, iso(bc.fill_ts), bc.skipped_bars),
                 ).rowcount  # fmt: skip
                 if not claimed:
                     raise _AlreadyDone
-                plan = plan_fill(book["cash"], book["units"], book["target"], bc.decision.target, bc.price, bc.cost_bps)
+                plan = plan_fill(book["cash"], book["units"], book["target"], decision.target, bc.price, bc.cost_bps)
                 if plan is not None:
                     latency = (bc.now - bc.fill_ts).total_seconds()
                     key = f"bar:{iso(bc.bar_ts)}"
@@ -356,6 +382,15 @@ class Store:
                 "ON CONFLICT(component) DO UPDATE SET ts=excluded.ts, pid=excluded.pid, status=excluded.status, "
                 "detail_json=excluded.detail_json",
                 (component, iso(now), os.getpid(), status, json.dumps(detail or {}, default=str)),
+            )
+
+    def note_next_check(self, component: str, seconds: float) -> None:
+        """Record when the component plans its next check, so the dashboard can tell a runner
+        that is backing off on schedule from one that stopped."""
+        with self.tx() as c:
+            c.execute(
+                "UPDATE heartbeat SET detail_json=json_set(detail_json, '$.next_check_s', ?) WHERE component=?",
+                (round(float(seconds), 1), component),
             )
 
     def queue_notification(self, book_id: str, text: str, now: pd.Timestamp) -> None:

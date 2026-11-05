@@ -99,8 +99,12 @@ function renderBeat() {
   if (r.status === "stopped") text = "Runner stopped " + ago(r.ts);
   else if (r.status === "offline") text += " (couldn't reach Binance)";
   else if (r.status === "degraded") text += " (a book had a problem, see below)";
-  if (age > 180 && r.status !== "stopped") text += ". The Mac may be asleep or the runner is not running.";
-  if (age > 180 || r.status !== "ok") box.classList.add("late");
+  // Late only past the runner's own planned next check (it backs off up to 10 min while Binance is down).
+  const planned = (r.detail && r.detail.next_check_s) || 30;
+  const late = age > Math.max(180, planned + 120);
+  if (r.status === "offline" && !late) text += "; still retrying, next try in about " + Math.max(1, Math.round((planned - age) / 60)) + " min";
+  if (late && r.status !== "stopped") text += ". The Mac may be asleep or the runner is not running.";
+  if (late || r.status !== "ok") box.classList.add("late");
   box.textContent = text;
 }
 function chart(points) {

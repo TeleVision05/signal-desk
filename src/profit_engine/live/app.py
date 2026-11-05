@@ -3,6 +3,9 @@
 Binds to localhost only. Every endpoint is a GET over :mod:`profit_engine.live.queries`
 (``PRAGMA query_only``), so the dashboard cannot change a book. The page is a single static
 HTML file (``static/index.html``) with inline JS: no build step, no external requests.
+
+Requests whose ``Host`` header is not a loopback name are refused (400): binding to
+127.0.0.1 alone does not stop a web page the user visits from reaching it by DNS rebinding.
 """
 
 from __future__ import annotations
@@ -13,8 +16,8 @@ import time
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, PlainTextResponse
 
 from profit_engine.live import paths, queries
 from profit_engine.live.store import Store
@@ -24,6 +27,8 @@ PORT = 8765
 STATIC = Path(__file__).resolve().parent / "static" / "index.html"
 NOT_FOUND = "We couldn't find that book. It may have been renamed in books.json."
 PORT_RETRY_S = 30.0
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
+WRONG_HOST = "This dashboard only answers at this Mac's own address: http://127.0.0.1:8765"
 log = logging.getLogger("signal_desk.dashboard")
 
 
@@ -31,6 +36,12 @@ def create_app(db_path: Path | None = None) -> FastAPI:
     db = Path(db_path or paths.db_path())
     Store(db).close()  # make sure the file and schema exist so an empty desk renders
     app = FastAPI(title="Signal Desk Live", docs_url=None, redoc_url=None, openapi_url=None)
+
+    @app.middleware("http")
+    async def loopback_only(request: Request, call_next):
+        if host_name(request.headers.get("host", "")) not in LOOPBACK_HOSTS:
+            return PlainTextResponse(WRONG_HOST, status_code=400)
+        return await call_next(request)
 
     def known(book_id: str) -> None:
         if not queries.book_exists(db, book_id):
@@ -68,6 +79,14 @@ def create_app(db_path: Path | None = None) -> FastAPI:
         return queries.decisions(db, book_id, limit)
 
     return app
+
+
+def host_name(header: str) -> str:
+    """The host part of a ``Host`` header, lowercased (``[::1]:8765`` -> ``[::1]``)."""
+    header = header.strip().lower()
+    if header.startswith("["):
+        return header[: header.find("]") + 1]
+    return header.split(":", 1)[0]
 
 
 def _port_free(host: str, port: int) -> bool:
